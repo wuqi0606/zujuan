@@ -47,6 +47,11 @@
         _formulaBaseByIndex = [];
     }
 
+    // 已处理片段缓存（模块级·全局持久，不分试卷）：按内容签名复用已构建的题目片段，
+    // 同一内容在不同试卷/会话间只处理一次。内存有界（LRU 上限 FRAGMENT_CACHE_CAP），超出淘汰最旧项。
+    const FRAGMENT_CACHE_CAP = 1500;
+    let _fragmentCache = new Map();
+
     // 打印内容块注册表：单一数据源，驱动排版面板 UI 生成、读写与渲染分支。
     // 新增内容块（如未来的「分析」「详解」）只需在此追加一项，无需改多处。
     const CONTENT_BLOCKS = [
@@ -627,6 +632,8 @@
             try {
                 // 重新打开新卷时清空公式基准缓存，避免不同试卷间共享公式 src 导致基准串味
                 resetFormulaBaseCache();
+                // [P1.1] 已处理片段缓存改为全局持久（模块级 _fragmentCache），不按新卷清空，
+                // 跨试卷复用同一内容签名片段；内存由 FRAGMENT_CACHE_CAP 上限约束。
                 const settings = this.getPreviewSettings(overrides);
                 this.savePreviewSettings(settings);
                 const flags = settings.contentFlags || ['q'];
@@ -731,6 +738,45 @@
         }
         _getCachedAnswerClone(wrap) {
             return (wrap && this._getAnswerCache().has(wrap)) ? this._getAnswerCache().get(wrap) : null;
+        }
+
+        // [P1.1] 已处理片段按内容签名缓存：核心提取/重建路径（generateSourceContentHTML 题目大分支）。
+        // 目的：复用已处理片段，避免预览重渲染（缩放/边距/页码等不改题目体的操作）每次都重做 DOM 克隆与
+        // 题号剥离/知识点提取/答案解析分支。安全性：
+        //  - 签名覆盖所有影响片段输出的输入（题型开关、字体字号行距、源 .wrapper.quesdiv 内容），任一变化即 miss 重处理；
+        //  - 公式尺寸冻结（preparePreviewTypography，依赖模块级 _formulaBaseBySrc / _formulaBaseByIndex）完整保留，未改动；
+        //  - 答案缓存（_answerCache，键为实时 wrap 引用）逻辑完整保留，未改动；
+        //  - 仅在答案处于稳定就绪态（内联含答案）或内容非空（附末尾答案块）时才缓存含答案片段，避免缓存空壳。
+        // 注意：缓存值为游离 DOM 节点引用（由 Map 强引用保值），复用时一律 cloneNode(true)，绝不把缓存节点本身插入结果树。
+        _getFragmentCache() {
+            // [P1.1] 全局缓存：直接返回模块级 _fragmentCache，跨试卷/会话复用，不再按实例或新卷清空。
+            return _fragmentCache;
+        }
+        _hashString(str) {
+            // djb2：将任意字符串压成短签名，作为缓存键，避免把大段 outerHTML 直接当键。
+            let h = 5381;
+            for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+            return (h >>> 0).toString(36);
+        }
+        _fragmentSignature(wrap, opts) {
+            const { includeQ, includeKP, includeA, atEnd, font, size, lineHeight } = opts;
+            const content = wrap ? wrap.outerHTML : '';
+            return 'f' + this._hashString(
+                `${includeQ ? 1 : 0}|${includeKP ? 1 : 0}|${includeA ? 1 : 0}|${atEnd ? 1 : 0}|${font}|${size}|${lineHeight}|${content}`
+            );
+        }
+        _cacheFragment(sig, pair) {
+            if (!sig || !pair) return;
+            const cache = _fragmentCache;
+            // 内存有界：达到上限且为新签名时，淘汰最早插入的项（Map 保持插入顺序，首项即最旧）。
+            if (cache.size >= FRAGMENT_CACHE_CAP && !cache.has(sig)) {
+                const oldest = cache.keys().next().value;
+                if (oldest !== undefined) cache.delete(oldest);
+            }
+            cache.set(sig, pair);
+        }
+        _getCachedFragment(sig) {
+            return (sig && this._getFragmentCache().has(sig)) ? this._getFragmentCache().get(sig) : null;
         }
 
         waitForImages(timeout = 4000) {
@@ -971,6 +1017,17 @@
                 const wrap = node.querySelector('.wrapper.quesdiv');
                 if (!wrap) return;
 
+                // [P1.1] 按内容签名复用已处理片段：签名覆盖题型开关/字体字号行距/源内容，任一变化即 miss 重处理。
+                // 命中则克隆缓存片段（题目体 + 附末尾答案块）入树并跳过本次重处理；克隆保证缓存节点本身不被插入结果树。
+                const fragSig = this._fragmentSignature(wrap, { includeQ, includeKP, includeA, atEnd, font, size, lineHeight });
+                const cachedFrag = this._getCachedFragment(fragSig);
+                if (cachedFrag) {
+                    tempDiv.appendChild(cachedFrag.q.cloneNode(true));
+                    if (cachedFrag.a) answersEndList.push(cachedFrag.a.cloneNode(true));
+                    questionIndex++;
+                    return;
+                }
+
                 const qWrapper = document.createElement('div');
                 qWrapper.className = 'q-wrapper';
                 qWrapper.dataset.blockId = `question-${questionIndex}`;
@@ -1029,14 +1086,18 @@
 
                 const cachedOpt = this._getCachedAnswerClone(wrap);
                 const opt = cachedOpt || wrap.querySelector('.exam-item__opt');
+                // [P1.1] 记录答案就绪态/附末尾答案块，供末尾按内容签名缓存判定（避免缓存空壳）。
+                let ansReady = false;
+                let builtAnsWrapper = null;
+                let answerHasRealContent = false;
                 if (opt) {
                     const optClone = opt.cloneNode(true);
                     // 仅在答案区已就绪时才缓存（避免缓存未展开时的空壳，否则用户后续手动展开答案、
                     // 重新打开预览时仍复用空壳，导致答案始终为空）。未就绪则每次重读实时 DOM。
                     if (!cachedOpt) {
                         const ansNode = optClone.querySelector('.item.answer');
-                        const ansReady = ansNode && (ansNode.querySelector('img, svg, canvas, table')
-                            || ansNode.textContent.replace(/\s/g, '').length > 2);
+                        ansReady = !!(ansNode && (ansNode.querySelector('img, svg, canvas, table')
+                            || ansNode.textContent.replace(/\s/g, '').length > 2));
                         if (ansReady) this._cacheAnswerClone(wrap, optClone);
                     }
                     // 知识点已在上面单独提取，这里移除避免重复
@@ -1069,9 +1130,9 @@
                         }
 
                         // 答案为空（无实质文本或图片）则跳过，不保留空题号
-                        const hasRealContent = answerWrap.querySelector('img, svg, canvas, table')
-                            || answerWrap.textContent.replace(/\s/g, '').length > 2;
-                        if (!hasRealContent) { /* 空：不加入列表 */ } else {
+                        answerHasRealContent = !!(answerWrap.querySelector('img, svg, canvas, table')
+                            || answerWrap.textContent.replace(/\s/g, '').length > 2);
+                        if (answerHasRealContent) {
                             const answerHeader = document.createElement('div');
                             answerHeader.className = 'zujuanjs-answer-title';
                             answerHeader.style.fontFamily = font;
@@ -1086,6 +1147,7 @@
                             ansWrapper.setAttribute('aria-label', `第 ${questionIndex} 题答案`);
                             ansWrapper.appendChild(answerWrap);
                             answersEndList.push(ansWrapper);
+                            builtAnsWrapper = ansWrapper;
                         }
                     } else if (includeA) {
                         // 勾选了答案（且未附末尾），整段放入（答案块）
@@ -1095,6 +1157,16 @@
 
                 qWrapper.appendChild(qDiv);
                 tempDiv.appendChild(qWrapper);
+                // [P1.1] 按内容签名缓存已处理片段：内联含答案的片段仅在答案就绪时缓存，避免缓存空壳；
+                // 附末尾的答案块（builtAnsWrapper）仅在内容非空时单独缓存。签名已覆盖题型开关/字体字号行距/源内容，
+                // 任一变化即 miss 重处理，复用安全。缓存值为游离节点，复用时一律 cloneNode(true)。
+                const cacheQuestion = (includeA && !atEnd) ? ansReady : true;
+                if (cacheQuestion) {
+                    this._cacheFragment(fragSig, {
+                        q: qWrapper,
+                        a: (atEnd && answerHasRealContent) ? builtAnsWrapper : null
+                    });
+                }
                 questionIndex++;
             });
 
@@ -1150,6 +1222,7 @@
                 autoCheckIn: GM_getValue('zujuanjsAutoCheckIn', false) === true,
                 selfCheck: GM_getValue('zujuanjsSelfCheck', false) === true,
                 layoutPresets: LAYOUT_PRESETS,
+                schema: PREVIEW_SETTING_SCHEMA,
                 token: PREVIEW_TOKEN
             }).replace(/</g, '\\u003c');
             const fontWeight = pageBold ? 'bold' : 'normal';
@@ -1265,7 +1338,7 @@
                         background: #fff; color: #ff4d4f; font-size: 12px; padding: 0 8px; white-space: nowrap;
                     }
 
-                    .zujuanjs-section-title { font-size: 1.25em; font-weight: bold; margin: 22px 0 12px; border-left: 4px solid #000; padding-left: 8px; page-break-inside: avoid; page-break-after: avoid; }
+                    .zujuanjs-section-title { display: flow-root; font-size: 1.25em; font-weight: bold; margin: 0 0 12px; padding-top: 22px; border-left: 4px solid #000; padding-left: 8px; page-break-inside: avoid; page-break-after: avoid; }
                     /* 参考答案标题：强制从新页开始（打印模式） */
                     .zujuanjs-answers-header { break-before: page; page-break-before: always; border-left: none; }
                     .zujuanjs-print-title { font-size: var(--title-size, 24px); text-align: center; font-weight: bold; margin: 15px 0 30px; line-height: 1.4; page-break-inside: avoid; }
@@ -2829,9 +2902,8 @@
                                         <label class="editor-field wide">字体<select class="form-select form-select-sm" id="setting-font">${buildSelectOptions(FONT_OPTIONS)}</select></label>
                                         <label class="editor-field">字号<select class="form-select form-select-sm" id="setting-size">${buildSelectOptions(SIZE_OPTIONS)}</select></label>
                                         <label class="editor-field">行距<select class="form-select form-select-sm" id="setting-line-height">${buildSelectOptions(LINE_HEIGHT_OPTIONS)}</select></label>
-                                        <label class="editor-field editor-field-unit">段间距<input class="form-control form-control-sm" id="setting-paragraph-spacing" type="number" min="0" max="24" step="1"><span>px</span></label>
                                         <label class="editor-field">对齐<select class="form-select form-select-sm" id="setting-align"><option value="left">左对齐</option><option value="justify">两端对齐</option></select></label>
-                                        <label class="editor-field editor-field-unit wide">题号间距<input class="form-control form-control-sm" id="setting-number-gap" type="number" min="0.2" max="2" step="0.05"><span>em</span></label>
+                                        <label class="editor-field editor-field-unit">题号间距<input class="form-control form-control-sm" id="setting-number-gap" type="number" min="0.2" max="2" step="0.05"><span>em</span></label>
                                     </div>
                                 </section>
                             </div>
@@ -2899,8 +2971,9 @@
                     const questionToolbar = document.getElementById('question-float-toolbar');
                     const editorSaveStatus = document.getElementById('editor-save-status');
                     const layoutPresetNote = document.getElementById('layout-preset-note');
-                    // 版式预设来自父窗口注入的单一来源（LAYOUT_PRESETS），与脚本定义保持一致
+                    // 版式预设与 schema 均来自父窗口注入的单一来源，与脚本定义保持一致
                     const layoutPresets = previewSettings.layoutPresets;
+                    const settingSchema = previewSettings.schema;
                     let currentLayout = previewSettings.previewLayout;
                     let currentZoom = previewSettings.previewZoom;
                     let currentScale = 1;
@@ -3017,12 +3090,19 @@
 
                         wrappers.forEach(wrapper => {
                             const state = getBlockEdit(wrapper.dataset.blockId);
-                            if (state.breakBefore && !wrapper.previousElementSibling?.classList.contains('page-break')) {
-                                const marker = document.createElement('div');
-                                marker.className = 'page-break';
-                                marker.dataset.ownerBlockId = wrapper.dataset.blockId;
-                                marker.dataset.breakSide = 'before';
-                                wrapper.parentNode.insertBefore(marker, wrapper);
+                            if (state.breakBefore) {
+                                // 若本题紧邻章节标题（小标题），把「前分页」分隔符插到标题之前，
+                                // 而非标题与题目之间：分页顺序变为「分隔符→标题→题目」，
+                                // 标题与题目一起换到下一页，避免「标题留在上页、题目跑到下页」被拆开。
+                                const prev = wrapper.previousElementSibling;
+                                const anchor = (prev && prev.classList.contains('zujuanjs-section-title')) ? prev : wrapper;
+                                if (!anchor.previousElementSibling?.classList.contains('page-break')) {
+                                    const marker = document.createElement('div');
+                                    marker.className = 'page-break';
+                                    marker.dataset.ownerBlockId = wrapper.dataset.blockId;
+                                    marker.dataset.breakSide = 'before';
+                                    wrapper.parentNode.insertBefore(marker, anchor);
+                                }
                             }
                             if (state.breakAfter && !wrapper.nextElementSibling?.classList.contains('page-break')) {
                                 const marker = document.createElement('div');
@@ -3064,7 +3144,6 @@
                         setSelectValue('setting-font', previewSettings.font);
                         setSelectValue('setting-size', previewSettings.size);
                         setSelectValue('setting-line-height', previewSettings.lineHeight);
-                        document.getElementById('setting-paragraph-spacing').value = previewSettings.paragraphSpacing;
                         setSelectValue('setting-align', previewSettings.contentAlign);
                         document.getElementById('setting-number-gap').value = previewSettings.numberGap;
                         ['top', 'right', 'bottom', 'left'].forEach((side, index) => {
@@ -3096,7 +3175,7 @@
                             font: document.getElementById('setting-font').value,
                             size: document.getElementById('setting-size').value,
                             lineHeight: document.getElementById('setting-line-height').value,
-                            paragraphSpacing: String(clamp(document.getElementById('setting-paragraph-spacing').value, 0, 24, 8)),
+                            paragraphSpacing: previewSettings.paragraphSpacing,
                             contentAlign: document.getElementById('setting-align').value === 'justify' ? 'justify' : 'left',
                             numberGap: String(clamp(document.getElementById('setting-number-gap').value, 0.2, 2, 0.55)),
                             pageMargins: [margin('top'), margin('right'), margin('bottom'), margin('left')].join(','),
@@ -3117,10 +3196,30 @@
                         };
                     }
 
-                    function applyLayoutPreset(name) {
+                    // 由注入的 schema 推导全部设置的默认值（与父窗口 getPreviewSettings 的 def 保持一致）。
+                    // 跳过 title（动态取卷名，保留当前值）；pageFont 缺省回退 font；csv/bool 类型还原为 def。
+                    function buildDefaultPreviewSettings() {
+                        const defaults = {};
+                        for (const s of settingSchema) {
+                            if (s.type === 'title') continue;
+                            if (s.type === 'pageFont') { defaults[s.key] = null; continue; }
+                            if (s.type === 'csv') { defaults[s.key] = String(s.def == null ? '' : s.def).split(',').filter(Boolean); continue; }
+                            if (s.type === 'boolStr') { defaults[s.key] = String(s.def) !== 'false'; continue; }
+                            if (s.type === 'boolObj') { defaults[s.key] = Boolean(s.def); continue; }
+                            defaults[s.key] = s.def;
+                        }
+                        if (defaults.pageFont == null) defaults.pageFont = defaults.font;
+                        return defaults;
+                    }
+
+                    function applyLayoutPreset(name, resetAll = false) {
                         const preset = layoutPresets[name];
                         if (!preset) return;
-                        Object.assign(previewSettings, preset.settings, { layoutPreset: name });
+                        // resetAll=true（"恢复默认"按钮）：先铺满 schema 默认值，再叠加预设覆盖项，
+                        // 保证所有字段都回退到默认，而非只改预设定义的几项（如 compact 仅 4 项）。
+                        // resetAll=false（显式预设按钮）：保持旧的部分合并行为，只改预设定义的项、保留用户其他设置。
+                        const base = resetAll ? buildDefaultPreviewSettings() : {};
+                        Object.assign(previewSettings, base, preset.settings, { layoutPreset: name });
                         currentLayout = previewSettings.previewLayout;
                         currentZoom = previewSettings.previewZoom;
                         writeSettingsToEditor();
@@ -3914,7 +4013,7 @@
                         });
                     });
                     document.getElementById('editor-reset').addEventListener('click', () => {
-                        applyLayoutPreset('compact');
+                        applyLayoutPreset('compact', true);
                     });
 
                     let resizePointerId = null;
@@ -4044,6 +4143,9 @@
                             // 没有 style.width，以自然尺寸渲染（比缩放后小）。注入的 html 已自带字体等内联样式，
                             // 无需再 applyDocumentStyles 重写所有题目节点，去掉冗余开销。
                             applyFormulaScale();
+                            // [题间距] 增量重建后重新应用文档样式变量（含 --question-spacing），
+                            // 确保跨页面复用同一 iframe 时间距等排版变量与当前 settings 一致。
+                            applyDocumentStyles();
                             scheduleRender();
                         }
                     });
