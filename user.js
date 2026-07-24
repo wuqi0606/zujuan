@@ -17,31 +17,157 @@
     'use strict';
 
     const Config = {
-        fontMode: 'original',
-        customFontFamily: '"Microsoft YaHei", "PingFang SC", "Noto Sans SC", Arial, sans-serif',
         adSelectors: ['.aside-pop.activity-btn', '.ai-entry.fixed'],
     };
+
+    // 父子 iframe 通信校验令牌：srcdoc 注入后，iframe 发出的每条消息都携带它，
+    // 父级监听据此拒绝伪造消息（即使页面被植入同源第三方脚本）。每次脚本加载随机生成。
+    const PREVIEW_TOKEN = 'zj' + Math.random().toString(36).slice(2, 14);
+
+    // 共享常量与辅助：集中抽取散落的魔数，便于审阅与统一调整。
+    // 沙箱 iframe（sandbox="allow-scripts" 无 allow-same-origin）postMessage 时 origin 为规范字符串 'null'；
+    // 父级来源校验必须放行该值，否则沙箱消息会被一律拒收（非笔误）。
+    const SANDBOX_NULL_ORIGIN = 'null';
+    // 防御性超时：极端情况下防止监听常驻 / 注入永久卡住 / 就绪承诺永不兑现。
+    const SAFETY_TIMEOUT_MS = 3000;
+    // 分页算法循环上限，防止异常 DOM 导致死循环。
+    const MAX_PAGINATE_ITER = 10000;
+    // 答案显式开关：试卷详情页（#isshowAnswer）与旧版容器（.tklabel-checkbox.show-answer input）指向同一 <input>；
+    // 自检与运行时检测共用此选择器，避免两边漂移。
+    const ANSWER_SWITCH_SEL = '#isshowAnswer, .tklabel-checkbox.show-answer input';
+    // iframe→父窗口经 postMessage 传偏好，布尔值被序列化为字符串，统一还原。
+    const parseBool = v => v === true || v === 'true';
+
+    // 公式基准尺寸缓存（模块级，跨重建持久；仅在打开新卷时清空）。
+    // 用于冻结首渲时公式的实时布局尺寸，避免原站切换/显示答案重排版导致公式缩放漂移。
+    let _formulaBaseBySrc = new Map();
+    let _formulaBaseByIndex = [];
+    function resetFormulaBaseCache() {
+        _formulaBaseBySrc = new Map();
+        _formulaBaseByIndex = [];
+    }
+
+    // 打印内容块注册表：单一数据源，驱动排版面板 UI 生成、读写与渲染分支。
+    // 新增内容块（如未来的「分析」「详解」）只需在此追加一项，无需改多处。
+    const CONTENT_BLOCKS = [
+        { key: 'q', label: '试题', locked: true },
+        { key: 'kp', label: '知识点' },
+        { key: 'a', label: '答案' },
+    ];
+
+    // 默认字体（多处复用，单一来源）
+    const DEFAULT_FONT = '"Times New Roman", SimSun, "Songti SC", serif';
+
+    // 纸张尺寸（mm）。A4 为默认，集中定义便于将来支持 A3/B5/Letter 等。
+    const A4 = { w: 210, h: 297 };
+
+    // 下拉选项单一来源：编辑器面板中的字体/字号/行距/页码字号下拉复用，避免与已删除的 get* 函数重复、改一处漏另一处。
+    const FONT_OPTIONS = [
+        { value: '"Times New Roman", SimSun, "Songti SC", serif', text: '宋体 + 新罗马' },
+        { value: 'SimSun, "Songti SC", serif', text: '宋体' },
+        { value: '"Microsoft YaHei", "PingFang SC", sans-serif', text: '微软雅黑' },
+        { value: 'SimHei, "PingFang SC", sans-serif', text: '黑体' },
+        { value: 'KaiTi, "Songti SC", serif', text: '楷体' },
+        { value: 'FangSong, "Songti SC", serif', text: '仿宋' },
+        { value: '"Noto Serif SC", "Times New Roman", serif', text: '思源宋体' },
+        { value: '"Noto Sans SC", "PingFang SC", sans-serif', text: '思源黑体' }
+    ];
+    const SIZE_OPTIONS = [
+        { value: '14px', text: '14px' }, { value: '15px', text: '15px' },
+        { value: '16px', text: '16px' }, { value: '17px', text: '17px' },
+        { value: '18px', text: '18px' }, { value: '20px', text: '20px' }, { value: '22px', text: '22px' }
+    ];
+    const LINE_HEIGHT_OPTIONS = [
+        { value: '1.2', text: '1.2 · 紧凑' }, { value: '1.35', text: '1.35' },
+        { value: '1.5', text: '1.5 · 标准' }, { value: '1.75', text: '1.75' }, { value: '2.0', text: '2.0 · 宽松' }
+    ];
+    const PAGE_SIZE_OPTIONS = [
+        { value: '10px', text: '10px' }, { value: '12px', text: '12px' },
+        { value: '14px', text: '14px' }, { value: '16px', text: '16px' }, { value: '18px', text: '18px' }
+    ];
+    function buildSelectOptions(options) {
+        // 选项值含双引号，用单引号包裹属性值以安全嵌入（值内不含单引号）。
+        return options.map(o => `<option value='${o.value}'>${o.text}</option>`).join('');
+    }
+
+    // 版式预设单一来源（X5.2）：原定义在 iframe 内，现上提到父窗口，序列化进 previewSettingsJson 注入，
+    // iframe 直接复用，避免改父窗口默认值却漏改 iframe 双源不一致。
+    const LAYOUT_PRESETS = Object.freeze({
+        exam: {
+            label: '考试标准',
+            settings: {
+                font: '"Times New Roman", SimSun, "Songti SC", serif', size: '16px', lineHeight: '1.5',
+                titleSize: '24px', pageFont: '"Times New Roman", SimSun, "Songti SC", serif', pageSize: '12px',
+                pageBold: true, showPageNumber: true, pageMargins: '18,15,22,15', questionSpacing: '10',
+                paragraphSpacing: '8', contentAlign: 'left', numberGap: '0.55', answerRowHeight: '1.8', pageGap: '20',
+                previewLayout: 'double', previewZoom: 'auto'
+            }
+        },
+        'word-normal': { label: 'Word 普通', settings: { pageMargins: '25.4,25.4,25.4,25.4' } },
+        'word-narrow': { label: 'Word 窄', settings: { pageMargins: '12.7,12.7,12.7,12.7' } },
+        'word-moderate': { label: 'Word 适中', settings: { pageMargins: '25.4,19.05,25.4,19.05' } },
+        'word-wide': { label: 'Word 宽', settings: { pageMargins: '25.4,50.8,25.4,50.8' } },
+        compact: { label: '紧凑省纸', settings: { pageMargins: '12,12,16,12', questionSpacing: '4', paragraphSpacing: '4', lineHeight: '1.35' } }
+    });
+
+    // 预览设置声明式 schema：集中管理「设置键 → 存储键 → 默认值 → 类型」，
+    // getPreviewSettings / savePreviewSettings 据此统一读写，消除数十行重复罗列与类型判断。
+    // type 取值：str(原样) | csv(逗号分隔数组) | boolStr(String!=='false') | boolObj(Boolean) | title(动态取卷名) | pageFont(回退font)
+    const PREVIEW_SETTING_SCHEMA = [
+        { key: 'contentFlags',    storage: 'printContentFlags', def: 'q',             type: 'csv' },
+        { key: 'answersAtEnd',    storage: 'printAnswersAtEnd', def: false,           type: 'boolStr' },
+        { key: 'font',            storage: 'questionFont',      def: DEFAULT_FONT,    type: 'str' },
+        { key: 'size',            storage: 'questionSize',      def: '16px',          type: 'str' },
+        { key: 'lineHeight',      storage: 'questionLineHeight',def: '1.35',          type: 'str' },
+        { key: 'title',           storage: null,                def: null,            type: 'title' },
+        { key: 'titleSize',       storage: 'titleSize',         def: '24px',          type: 'str' },
+        { key: 'pageFont',        storage: 'pageFont',          def: null,            type: 'pageFont' },
+        { key: 'pageSize',        storage: 'pageSize',          def: '12px',          type: 'str' },
+        { key: 'pageBold',        storage: 'pageBold',          def: true,            type: 'boolStr' },
+        { key: 'showPageNumber',  storage: 'showPageNumber',    def: true,            type: 'boolObj' },
+        { key: 'pageMargins',     storage: 'pageMargins',       def: '12,12,16,12',   type: 'str' },
+        { key: 'layoutPreset',    storage: 'layoutPreset',      def: 'compact',       type: 'str' },
+        { key: 'questionSpacing', storage: 'questionSpacing',   def: '4',             type: 'str' },
+        { key: 'previewLayout',   storage: 'previewLayout',     def: 'double',        type: 'str' },
+        { key: 'previewZoom',     storage: 'previewZoom',       def: 'auto',          type: 'str' },
+        { key: 'paragraphSpacing',storage: 'paragraphSpacing',  def: '4',             type: 'str' },
+        { key: 'contentAlign',    storage: 'contentAlign',      def: 'left',          type: 'str' },
+        { key: 'numberGap',       storage: 'numberGap',         def: '0.55',          type: 'str' },
+        { key: 'answerRowHeight', storage: 'answerRowHeight',   def: '1.8',           type: 'str' },
+        { key: 'pageGap',         storage: 'pageGap',           def: '20',            type: 'str' },
+        { key: 'editorPanelWidth',storage: 'editorPanelWidth',  def: '340',           type: 'str' },
+        { key: 'editorPanelTab',  storage: 'editorPanelTab',    def: 'document',      type: 'str' },
+        { key: 'editorOpen',      storage: 'editorOpen',        def: true,            type: 'boolStr' },
+    ];
+
+    function coerceSetting(type, stored, def) {
+        switch (type) {
+            case 'csv': {
+                const raw = stored == null || stored === '' ? def : stored;
+                return String(raw).split(',').filter(Boolean);
+            }
+            case 'boolStr': return String(stored) !== 'false';
+            case 'boolObj': return Boolean(stored);
+            default: return stored == null ? def : stored;
+        }
+    }
 
     // ==========================================
     // 全局样式
     // ==========================================
     GM_addStyle(`
         .zujuanjs-float-print-btn {
-            position: fixed !important; bottom: 30px !important; right: 30px !important;
-            width: 56px !important; height: 56px !important; border-radius: 50% !important;
+            position: fixed !important; top: 110px !important; right: 30px !important;
+            height: 34px !important; padding: 0 15px !important; border-radius: 5px !important;
             background: #1677ff !important; color: #fff !important; border: none !important;
-            box-shadow: 0 4px 14px rgba(22, 119, 255, 0.4) !important; cursor: pointer !important;
-            z-index: 99999 !important; display: flex !important; align-items: center !important;
-            justify-content: center !important; transition: all 0.3s ease !important; font-size: 22px !important;
+            cursor: pointer !important;
+            z-index: 99999 !important; display: inline-flex !important; align-items: center !important;
+            justify-content: center !important; transition: background 0.2s ease !important; font-size: 14px !important; font-weight: 500 !important; line-height: 34px !important;
         }
-        .zujuanjs-float-print-btn:hover { background: #4096ff !important; box-shadow: 0 6px 20px rgba(22, 119, 255, 0.5) !important; transform: translateY(-2px) !important; }
-        .zujuanjs-float-print-btn:active { transform: translateY(0) !important; box-shadow: 0 2px 8px rgba(22, 119, 255, 0.3) !important; }
-        .zujuanjs-float-print-btn-text { display: none; }
-        @media (min-width: 768px) {
-            .zujuanjs-float-print-btn { width: auto !important; height: auto !important; border-radius: 28px !important; padding: 12px 24px !important; font-size: 15px !important; font-weight: 500 !important; letter-spacing: 0 !important; }
-            .zujuanjs-float-print-btn-icon { margin-right: 6px; }
-            .zujuanjs-float-print-btn-text { display: inline; }
-        }
+        .zujuanjs-float-print-btn:hover { background: #0f68df !important; }
+        .zujuanjs-float-print-btn:active { background: #0d5bc0 !important; }
+        .zujuanjs-float-print-btn-icon { margin-right: 6px; display: inline-flex !important; align-items: center !important; }
+        .zujuanjs-float-print-btn-text { display: inline; }
 
         /* ===== 打印设置对话框 - 紧凑布局 ===== */
         .print-dialog-container { text-align: left; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 0 2px; }
@@ -191,6 +317,7 @@
         /* 预览遮罩层 */
         #zujuanjs-preview-overlay {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 100000; background: #000;
+            opacity: 0; transition: opacity .15s ease;
         }
         #zujuanjs-preview-overlay iframe { width: 100%; height: 100%; border: none; }
     `);
@@ -199,14 +326,21 @@
         constructor() { this.init(); }
 
         init() {
-            this.applyFont();
+            // 公式基准尺寸缓存已改为模块级（见文件顶部 _formulaBaseBySrc / _formulaBaseByIndex），跨重建持久。
             this.autoCheckIn();
             this.createFloatingButton();
+            // [C] 自检模式：编辑器勾选「自检模式」或 URL 带 #selfcheck 时，延迟运行（等 SPA 渲染题目）
+            const enableSelfCheck = GM_getValue('zujuanjsSelfCheck', false) === true
+                || (location.hash || '').toLowerCase().indexOf('selfcheck') !== -1;
+            if (enableSelfCheck) setTimeout(() => this.runSelfCheck(), 1500);
             if (document.body) this.startAdRemover();
             else document.addEventListener('DOMContentLoaded', () => this.startAdRemover());
 
             window.addEventListener('message', (e) => {
-                if (e.data && e.data.type === 'closeZujuanPreview') {
+                // 安全加固：拒绝非本页来源且非沙箱(null)来源、或缺少/不匹配令牌的消息
+                if (e.origin && e.origin !== window.location.origin && e.origin !== SANDBOX_NULL_ORIGIN) return;
+                if (!e.data || typeof e.data !== 'object' || e.data.token !== PREVIEW_TOKEN) return;
+                if (e.data.type === 'closeZujuanPreview') {
                     const overlay = document.getElementById('zujuanjs-preview-overlay');
                     if (overlay) overlay.remove();
                 } else if (e.data && e.data.type === 'saveZujuanPreviewPreference') {
@@ -223,18 +357,63 @@
                         GM_setValue('editorPanelTab', e.data.value);
                     }
                     if (e.data.key === 'editorOpen' && ['true', 'false'].includes(e.data.value)) {
-                        GM_setValue('editorOpen', e.data.value === 'true');
+                        GM_setValue('editorOpen', parseBool(e.data.value));
+                    }
+                    if (e.data.key === 'autoCheckIn' && ['true', 'false'].includes(e.data.value)) {
+                        GM_setValue('zujuanjsAutoCheckIn', parseBool(e.data.value));
+                    }
+                    if (e.data.key === 'selfCheck' && ['true', 'false'].includes(e.data.value)) {
+                        GM_setValue('zujuanjsSelfCheck', parseBool(e.data.value));
                     }
                 } else if (e.data && e.data.type === 'saveZujuanPrintSettings') {
                     this.savePreviewSettings(e.data.settings);
                 } else if (e.data && e.data.type === 'rebuildZujuanPreview') {
-                    this.openPreviewWithSettings(e.data.settings);
+                    // 增量重建：仅把新生成的题目内容 HTML 发回 iframe，由 iframe 内部替换 sourceContent 并重渲染，
+                    // 避免每次重建都重新设置 iframe.srcdoc 触发整页重载（表现为黑屏闪烁）。
+                    const iframe = document.querySelector('#zujuanjs-preview-overlay iframe.zujuanjs-preview-frame');
+                    if (iframe && iframe.contentWindow) {
+                        try {
+                            const settings = this.getPreviewSettings(e.data.settings || {});
+                            const flags = settings.contentFlags || ['q'];
+                            const includeQuestions = flags.includes('q');
+                            const includeKnowledge = flags.includes('kp');
+                            const includeAnswers = flags.includes('a');
+                            const answersAtEnd = Boolean(settings.answersAtEnd);
+                            // [需求4] 不自动点击答案开关；仅当用户已在页面手动展开答案时才提取（否则答案区为空）
+                            const answersExpanded = this.answersExpandedOnPage();
+                            const sourceHtml = this.generateSourceContentHTML({
+                                includeQ: includeQuestions,
+                                includeKP: includeKnowledge,
+                                includeA: includeAnswers && answersExpanded,
+                                atEnd: answersAtEnd && answersExpanded,
+                                font: settings.font,
+                                size: settings.size,
+                                lineHeight: settings.lineHeight,
+                                title: settings.title,
+                                pageFont: settings.pageFont || settings.font,
+                                pageSize: settings.pageSize || '12px',
+                                pageBold: settings.pageBold,
+                                layoutOptions: settings
+                            });
+                            iframe.contentWindow.postMessage({ type: 'updateZujuanSource', token: PREVIEW_TOKEN, html: sourceHtml.html }, '*');
+                            // 增量更新也要落盘，否则关闭预览后重新打开会丢失本次勾选
+                            this.savePreviewSettings(settings);
+                        } catch (err) {
+                            console.error('[组卷打印] 增量重建预览失败，回退整页重载：', err);
+                            this.openPreviewWithSettings(e.data.settings);
+                        }
+                    } else {
+                        this.openPreviewWithSettings(e.data.settings);
+                    }
+                } else if (e.data && e.data.type === 'zujuanPreviewRendered') {
+                    // iframe 首屏渲染完成：淡入 overlay，避免 srcdoc 重载期间的黑屏闪烁
+                    const overlay = document.getElementById('zujuanjs-preview-overlay');
+                    if (overlay) overlay.style.opacity = '1';
+                    // [E3.2] 兑现「就绪」承诺，放行等待中的答案增量注入
+                    if (this._previewReadyResolve) { this._previewReadyResolve(); this._previewReadyResolve = null; }
+                    this._previewReady = true;
                 }
             });
-        }
-
-        applyFont() {
-            if (Config.fontMode === 'custom') GM_addStyle(`body, * { font-family: ${Config.customFontFamily} !important; }`);
         }
 
         getPaperTitle() {
@@ -247,6 +426,9 @@
         }
 
         autoCheckIn() {
+            // [S4.2] 默认关闭：仅在用户显式开启自动签到时才执行，避免对账号产生未授权的副作用。
+            // 开启方式：在控制台执行 GM_setValue('zujuanjsAutoCheckIn', true)，或在编辑器面板勾选「自动签到」。
+            if (GM_getValue('zujuanjsAutoCheckIn', false) !== true) return;
             setTimeout(() => {
                 const signedInLink = document.querySelector('.user-assets-box a.assets-method[href="/score_task/"]');
                 if (signedInLink && signedInLink.textContent.trim() !== '已签到') {
@@ -254,6 +436,82 @@
                     document.querySelector('a.day-sign-in')?.click();
                 }
             }, 2500);
+        }
+
+        runSelfCheck() {
+            // [C] 自检模式：打开页面时自动校验脚本依赖的关键 DOM 与配置，结果打印到控制台。
+            // 启用：编辑器面板勾选「自检模式」，或在 URL 后加 #selfcheck 强制本次运行。
+            // 组卷中心通过点击题目本身展开答案，没有显式「显示答案」开关；
+            // 试卷详情页才有显式开关（#isshowAnswer / .tklabel-checkbox.show-answer input）。
+            // 据此判断显式答案开关自检项是否适用，避免组卷中心页面永远误报「缺失」。
+            const pageHasExplicitAnswerSwitch = !!document.querySelector(ANSWER_SWITCH_SEL);
+            const domRules = [
+                { name: '试题根 .tk-quest-item.quesroot', sel: '.tk-quest-item.quesroot', required: true },
+                { name: '小节标题 .sec-title/.questypetitle', sel: '.sec-title, .questype-head .questypetitle', required: false },
+                { name: '答案开关 #isshowAnswer', sel: ANSWER_SWITCH_SEL, required: false, onlyIfExplicitSwitch: true },
+                // 跨页面通用·结构检查：自检在页面加载时运行，而组卷中心答案需手动点开、刷新即丢失，
+                // 故「答案当前是否已渲染」属运行时状态，加载那一刻永远不成立，不适合做自检项（会永远失败、误导）。
+                // 改为校验脚本提取答案所依赖的结构锚点 .exam-item__opt（答案区所在容器，静态 DOM 中即存在、未展开时为空），
+                // 与运行时是否展开无关；真正「答案是否已显示」由打印时的 answersExpandedOnPage() 在用户点击后判定。
+                { name: '答案提取锚点 .exam-item__opt', sel: '.exam-item__opt', required: false },
+                { name: '打印按钮 .zujuanjs-float-print-btn', sel: '.zujuanjs-float-print-btn', required: true },
+                { name: '签到入口 .user-assets-box a[href="/score_task/"]', sel: '.user-assets-box a[href="/score_task/"]', required: false },
+            ];
+            const domResults = domRules.map(r => {
+                let hits = 0;
+                try { hits = document.querySelectorAll(r.sel).length; } catch (e) { hits = -1; }
+                // 显式答案开关仅适用于试卷详情页；组卷中心无此元素，标记为「不适用」而非「缺失」，避免误报
+                if (r.onlyIfExplicitSwitch && !pageHasExplicitAnswerSwitch) {
+                    return { 检查项: r.name, 选择器: r.sel, 命中: 0, 状态: '不适用' };
+                }
+                const ok = hits > 0;
+                return { 检查项: r.name, 选择器: r.sel, 命中: hits, 状态: ok ? 'OK' : (r.required ? '缺失(必需)' : '缺失(可选)') };
+            });
+
+            // 公式识别功能校验：抽样前 30 张 img，确认 isFormulaSvgImage 仍能识别
+            let imgTotal = 0, formulaHits = 0;
+            try {
+                const imgs = Array.from(document.querySelectorAll('img')).slice(0, 30);
+                imgTotal = imgs.length;
+                formulaHits = imgs.filter(img => this.isFormulaSvgImage(img)).length;
+            } catch (e) {}
+            domResults.push({
+                检查项: '公式识别 isFormulaSvgImage', 选择器: 'img(抽样≤30)', 命中: `${formulaHits}/${imgTotal}`,
+                状态: imgTotal === 0 ? '无样本' : (formulaHits > 0 || imgTotal < 30 ? 'OK' : '未识别')
+            });
+
+            // 代码/配置层自检（模块级常量在父窗口作用域内可直接访问）
+            const codeRules = [
+                { name: 'PREVIEW_TOKEN', ok: !!PREVIEW_TOKEN },
+                { name: 'A4 常量', ok: (typeof A4 === 'object' && A4.w === 210 && A4.h === 297) },
+                { name: 'LAYOUT_PRESETS.compact', ok: !!(typeof LAYOUT_PRESETS === 'object' && LAYOUT_PRESETS.compact) },
+                { name: 'FONT_OPTIONS', ok: Array.isArray(FONT_OPTIONS) && FONT_OPTIONS.length > 0 },
+                { name: 'PREVIEW_SETTING_SCHEMA', ok: Array.isArray(PREVIEW_SETTING_SCHEMA) && PREVIEW_SETTING_SCHEMA.length > 0 },
+                { name: 'getPreviewSettings()', ok: (() => { try { return !!this.getPreviewSettings({}); } catch (e) { return false; } })() },
+            ];
+            const codeResults = codeRules.map(r => ({ 检查项: r.name, 选择器: '—', 命中: r.ok ? 1 : 0, 状态: r.ok ? 'OK' : '异常' }));
+
+            const all = domResults.concat(codeResults);
+            // 仅「必需依赖缺失」与「配置异常」算未通过；可选依赖缺失属正常现象，单独提示不计入失败。
+            const failed = all.filter(x => x.状态 === '缺失(必需)' || x.状态 === '异常');
+            const optionalMissing = all.filter(x => x.状态 === '缺失(可选)');
+            const notApplicable = all.filter(x => x.状态 === '不适用');
+
+            console.log('%c[组卷自检] 关键 DOM / 配置校验', 'color:#1677ff;font-weight:bold');
+            try { console.table(all); } catch (e) { all.forEach(r => console.log(`  - ${r.检查项}: ${r.状态} (${r.命中})`)); }
+            if (failed.length) {
+                console.warn('%c[组卷自检] 未通过 ' + failed.length + ' 项（必需依赖缺失）：' + failed.map(x => x.检查项).join('、'), 'color:#fa8c16');
+            } else {
+                console.log('%c[组卷自检] 全部通过 ✅', 'color:#52c41a;font-weight:bold');
+            }
+            if (notApplicable.length) {
+                console.info('%c[组卷自检] 不适用 ' + notApplicable.length + ' 项（当前页面无此结构，非异常）：' + notApplicable.map(x => x.检查项).join('、'), 'color:#bfbfbf');
+            }
+            if (optionalMissing.length) {
+                console.info('%c[组卷自检] 可选依赖未出现 ' + optionalMissing.length + ' 项（属正常，不影响功能）：' + optionalMissing.map(x => x.检查项).join('、'), 'color:#8c8c8c');
+            }
+            this._lastSelfCheck = { total: all.length, failed: failed.length, optionalMissing: optionalMissing.length, results: all };
+            return this._lastSelfCheck;
         }
 
         createFloatingButton() {
@@ -272,75 +530,26 @@
         }
 
         startAdRemover() {
+            let pending = null;
             const observer = new MutationObserver(() => {
-                Config.adSelectors.forEach(sel => document.querySelector(sel)?.remove());
+                // 防抖：合并短时间内多次 DOM 变动，避免高频重复查询
+                if (pending) return;
+                pending = setTimeout(() => {
+                    pending = null;
+                    let removed = false;
+                    Config.adSelectors.forEach(sel => {
+                        const el = document.querySelector(sel);
+                        if (el) { el.remove(); removed = true; }
+                    });
+                    // 广告元素删完即停止监听，不再常驻轮询整个 body
+                    if (removed && !Config.adSelectors.some(sel => document.querySelector(sel))) {
+                        observer.disconnect();
+                    }
+                }, 300);
             });
             observer.observe(document.body, { childList: true, subtree: true });
-        }
-
-        getFontOptions() {
-            return [
-                { value: '"Times New Roman", SimSun, "Songti SC", serif', text: '宋体 + 新罗马' },
-                { value: 'SimSun, "Songti SC", serif', text: '宋体' },
-                { value: '"Microsoft YaHei", "PingFang SC", sans-serif', text: '微软雅黑' },
-                { value: 'SimHei, "PingFang SC", sans-serif', text: '黑体' },
-                { value: 'KaiTi, "Songti SC", serif', text: '楷体' },
-                { value: 'FangSong, "Songti SC", serif', text: '仿宋' },
-                { value: '"Noto Serif SC", "Times New Roman", serif', text: '思源宋体' },
-                { value: '"Noto Sans SC", "PingFang SC", sans-serif', text: '思源黑体' }
-            ];
-        }
-
-        getSizeOptions() {
-            return [
-                { value: '14px', text: '14px' }, { value: '15px', text: '15px' },
-                { value: '16px', text: '16px' }, { value: '17px', text: '17px' },
-                { value: '18px', text: '18px' }, { value: '20px', text: '20px' }, { value: '22px', text: '22px' }
-            ];
-        }
-
-        getLineHeightOptions() {
-            return [
-                { value: '1.2', text: '1.2 · 紧凑' }, { value: '1.35', text: '1.35' },
-                { value: '1.5', text: '1.5 · 标准' }, { value: '1.75', text: '1.75' }, { value: '2.0', text: '2.0 · 宽松' }
-            ];
-        }
-
-        getPageSizeOptions() {
-            return [
-                { value: '10px', text: '10px' }, { value: '12px', text: '12px' },
-                { value: '14px', text: '14px' }, { value: '16px', text: '16px' }, { value: '18px', text: '18px' }
-            ];
-        }
-
-        getBoldOptions() {
-            return [{ value: 'false', text: '不加粗' }, { value: 'true', text: '加粗' }];
-        }
-
-        escapeAttribute(value) {
-            return String(value)
-                .replace(/&/g, '&amp;')
-                .replace(/"/g, '&quot;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-        }
-
-        renderSelect(id, options, defaultValue) {
-            let allOptions = options.slice();
-            const exists = allOptions.some(o => o.value === defaultValue);
-            if (!exists && defaultValue !== undefined && defaultValue !== '') {
-                allOptions.unshift({ value: defaultValue, text: '自定义' });
-            }
-            const selected = allOptions.find(o => o.value === defaultValue) || allOptions[0];
-            const escapeAttr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            const optsHtml = allOptions.map(o =>
-                `<div class="print-custom-select-option${o.value === selected.value ? ' selected' : ''}" data-value="${escapeAttr(o.value)}">${o.text}</div>`
-            ).join('');
-            return `
-                <div class="print-custom-select" id="${id}" data-value="${escapeAttr(selected.value)}">
-                    <div class="print-custom-select-trigger"><span>${selected.text}</span><div class="print-custom-select-arrow"></div></div>
-                    <div class="print-custom-select-dropdown">${optsHtml}</div>
-                </div>`;
+            // 兜底：3 秒后无论是否清理干净都断开，防止极端情况下监听常驻
+            setTimeout(() => observer.disconnect(), SAFETY_TIMEOUT_MS);
         }
 
         initSelect(id, onChange) {
@@ -369,367 +578,236 @@
             });
         }
 
-        showPrintDialogLegacy() {
-            const savedFont = GM_getValue('questionFont', '"Times New Roman", SimSun, "Songti SC", serif');
-            const savedSize = GM_getValue('questionSize', '16px');
-            const savedLineHeight = GM_getValue('questionLineHeight', '1.5');
-            const savedPageFont = GM_getValue('pageFont', savedFont);
-            const savedPageSize = GM_getValue('pageSize', '12px');
-            const savedPageBold = String(GM_getValue('pageBold', true));
-            const savedMode = GM_getValue('printMode', 'q');
-            const savedMargins = GM_getValue('pageMargins', '18,15,22,15');
-            const savedQuestionSpacing = String(GM_getValue('questionSpacing', '10'));
-            const savedPreviewLayout = GM_getValue('previewLayout', 'double');
-            const savedPreviewZoom = String(GM_getValue('previewZoom', 'auto'));
-            const defaultTitle = this.getPaperTitle();
-
-            const fontOptions = this.getFontOptions();
-            const sizeOptions = this.getSizeOptions();
-            const lineHeightOptions = this.getLineHeightOptions();
-            const pageSizeOptions = this.getPageSizeOptions();
-            const boldOptions = this.getBoldOptions();
-
-            const modeOptions = [
-                { value: 'q', text: '仅试题' },
-                { value: 'qa', text: '试题与答案' },
-                { value: 'qe', text: '答案附末尾' },
-                { value: 'a', text: '仅答案' }
-            ];
-            const marginOptions = [
-                { value: '12,12,18,12', text: '紧凑' },
-                { value: '18,15,22,15', text: '标准' },
-                { value: '22,18,26,18', text: '宽松' }
-            ];
-            const spacingOptions = [
-                { value: '4', text: '4px 紧凑' },
-                { value: '10', text: '10px 标准' },
-                { value: '16', text: '16px' },
-                { value: '22', text: '22px 宽松' }
-            ];
-            const zoomOptions = [
-                { value: 'auto', text: '自动适应' },
-                { value: '0.65', text: '65%' },
-                { value: '0.8', text: '80%' },
-                { value: '1', text: '100%' }
-            ];
-
-            const closeAllSelects = (e) => {
-                if (!e.target.closest('.print-custom-select')) {
-                    document.querySelectorAll('.print-custom-select.open').forEach(s => s.classList.remove('open'));
-                }
-            };
-
-            Swal.fire({
-                title: '打印设置',
-                width: 700,
-                customClass: { popup: 'print-dialog-popup' },
-                confirmButtonColor: '#1677ff',
-                cancelButtonColor: '#d9d9d9',
-                html: `
-                    <div class="print-dialog-container">
-                        <div class="print-dialog-section">
-                            <label class="print-dialog-label">试卷标题</label>
-                            <input type="text" id="print-title-input" class="print-dialog-input" value="${this.escapeAttribute(defaultTitle)}" placeholder="留空则不显示标题">
-                        </div>
-
-                        <div class="print-dialog-section">
-                            <label class="print-dialog-label">打印内容</label>
-                            <div class="print-option-grid" id="print-mode-grid">
-                                ${modeOptions.map(m => `
-                                    <label class="print-option-card${m.value === savedMode ? ' active' : ''}">
-                                        <input type="radio" name="printMode" value="${m.value}" ${m.value === savedMode ? 'checked' : ''}>
-                                        <span>${m.text}</span>
-                                    </label>`).join('')}
-                            </div>
-                        </div>
-
-                        <div class="print-dialog-section">
-                            <label class="print-dialog-label">正文样式</label>
-                            <div class="print-row-3">
-                                <div class="print-field">
-                                    <div class="print-field-label">字体</div>
-                                    ${this.renderSelect('print-font-select', fontOptions, savedFont)}
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">字号</div>
-                                    ${this.renderSelect('print-size-select', sizeOptions, savedSize)}
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">行距</div>
-                                    ${this.renderSelect('print-lineheight-select', lineHeightOptions, savedLineHeight)}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="print-dialog-section">
-                            <label class="print-dialog-label">页面排版</label>
-                            <div class="print-row-4">
-                                <div class="print-field">
-                                    <div class="print-field-label">预览排布</div>
-                                    <div class="print-option-grid print-layout-grid" id="print-layout-grid">
-                                        <label class="print-option-card${savedPreviewLayout === 'single' ? ' active' : ''}">
-                                            <input type="radio" name="previewLayout" value="single" ${savedPreviewLayout === 'single' ? 'checked' : ''}>
-                                            <span>单页</span>
-                                        </label>
-                                        <label class="print-option-card${savedPreviewLayout === 'double' ? ' active' : ''}">
-                                            <input type="radio" name="previewLayout" value="double" ${savedPreviewLayout === 'double' ? 'checked' : ''}>
-                                            <span>双页</span>
-                                        </label>
-                                    </div>
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">预览缩放</div>
-                                    ${this.renderSelect('print-zoom-select', zoomOptions, savedPreviewZoom)}
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">页边距</div>
-                                    ${this.renderSelect('print-margin-select', marginOptions, savedMargins)}
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">题间距</div>
-                                    ${this.renderSelect('print-spacing-select', spacingOptions, savedQuestionSpacing)}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="print-dialog-section">
-                            <label class="print-dialog-label">页码样式</label>
-                            <div class="print-row-3">
-                                <div class="print-field">
-                                    <div class="print-field-label">字体</div>
-                                    ${this.renderSelect('print-pagefont-select', fontOptions, savedPageFont)}
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">字号</div>
-                                    ${this.renderSelect('print-pagesize-select', pageSizeOptions, savedPageSize)}
-                                </div>
-                                <div class="print-field">
-                                    <div class="print-field-label">字重</div>
-                                    ${this.renderSelect('print-pagebold-select', boldOptions, savedPageBold)}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="print-dialog-section">
-                            <div class="print-preview-wrap">
-                                <span class="print-preview-caption">样例</span>
-                                <div class="print-preview-box" id="print-preview">
-                                    1.&emsp;已知函数 f(x) = ax² + bx + c (a ≠ 0)，在区间 [1, 5] 上单调递增。
-                                </div>
-                            </div>
-                        </div>
-                    </div>`,
-                confirmButtonText: '进入A4预览',
-                showCancelButton: true,
-                cancelButtonText: '取消',
-                didOpen: () => {
-                    const preview = document.getElementById('print-preview');
-                    const updatePreview = () => {
-                        const fontSelect = document.getElementById('print-font-select');
-                        const sizeSelect = document.getElementById('print-size-select');
-                        const lhSelect = document.getElementById('print-lineheight-select');
-                        const font = fontSelect ? fontSelect.dataset.value : savedFont;
-                        const size = sizeSelect ? sizeSelect.dataset.value : savedSize;
-                        const lh = lhSelect ? lhSelect.dataset.value : savedLineHeight;
-                        preview.style.fontFamily = font;
-                        preview.style.fontSize = size;
-                        preview.style.lineHeight = lh;
-                    };
-
-                    this.initSelect('print-font-select', () => updatePreview());
-                    this.initSelect('print-size-select', () => updatePreview());
-                    this.initSelect('print-lineheight-select', () => updatePreview());
-                    this.initSelect('print-pagefont-select');
-                    this.initSelect('print-pagesize-select');
-                    this.initSelect('print-pagebold-select');
-                    this.initSelect('print-zoom-select');
-                    this.initSelect('print-margin-select');
-                    this.initSelect('print-spacing-select');
-
-                    ['print-mode-grid', 'print-layout-grid'].forEach(gridId => {
-                        const grid = document.getElementById(gridId);
-                        grid?.querySelectorAll('.print-option-card').forEach(card => {
-                            card.addEventListener('click', () => {
-                                grid.querySelectorAll('.print-option-card').forEach(c => c.classList.remove('active'));
-                                card.classList.add('active');
-                            });
-                        });
-                    });
-
-                    document.addEventListener('click', closeAllSelects);
-                    updatePreview();
-                },
-                willClose: () => {
-                    document.removeEventListener('click', closeAllSelects);
-                },
-                preConfirm: () => ({
-                    mode: document.querySelector('input[name="printMode"]:checked')?.value || 'q',
-                    font: document.getElementById('print-font-select')?.dataset.value || savedFont,
-                    size: document.getElementById('print-size-select')?.dataset.value || savedSize,
-                    lineHeight: document.getElementById('print-lineheight-select')?.dataset.value || savedLineHeight,
-                    title: document.getElementById('print-title-input').value.trim(),
-                    pageFont: document.getElementById('print-pagefont-select')?.dataset.value || savedPageFont,
-                    pageSize: document.getElementById('print-pagesize-select')?.dataset.value || savedPageSize,
-                    pageBold: document.getElementById('print-pagebold-select')?.dataset.value === 'true',
-                    pageMargins: document.getElementById('print-margin-select')?.dataset.value || savedMargins,
-                    questionSpacing: document.getElementById('print-spacing-select')?.dataset.value || savedQuestionSpacing,
-                    previewLayout: document.querySelector('input[name="previewLayout"]:checked')?.value || savedPreviewLayout,
-                    previewZoom: document.getElementById('print-zoom-select')?.dataset.value || savedPreviewZoom
-                })
-            }).then(async res => {
-                if (!res.isConfirmed) return;
-                const { mode, font, size, lineHeight, title, pageFont, pageSize, pageBold, pageMargins, questionSpacing, previewLayout, previewZoom } = res.value;
-                GM_setValue('questionFont', font);
-                GM_setValue('questionSize', size);
-                GM_setValue('questionLineHeight', lineHeight);
-                GM_setValue('pageFont', pageFont || font);
-                GM_setValue('pageSize', pageSize || '12px');
-                GM_setValue('pageBold', pageBold);
-                GM_setValue('printMode', mode);
-                GM_setValue('pageMargins', pageMargins);
-                GM_setValue('questionSpacing', questionSpacing);
-                GM_setValue('previewLayout', previewLayout);
-                GM_setValue('previewZoom', previewZoom);
-
-                const includeQuestions = mode !== 'a';
-                const includeAnswers = mode === 'qa' || mode === 'a';
-                const answersAtEnd = mode === 'qe';
-
-                if (includeAnswers || answersAtEnd) {
-                    Swal.fire({ title: '请稍候', text: '正在准备答案解析...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
-                    this.triggerShowAnswers();
-                    await this.waitForImages();
-                    Swal.close();
-                }
-
-                const htmlContent = this.generatePreviewHTML(
-                    includeQuestions,
-                    includeAnswers,
-                    answersAtEnd,
-                    font,
-                    size,
-                    lineHeight,
-                    title,
-                    pageFont || font,
-                    pageSize || '12px',
-                    pageBold,
-                    { pageMargins, questionSpacing, previewLayout, previewZoom }
-                );
-                this.openPreview(htmlContent);
-            });
-        }
-
         getPreviewSettings(overrides = {}) {
+            // [已移除] 旧版「exam→compact」一次性迁移：PREVIEW_SETTING_SCHEMA 中 layoutPreset 的 def 已是 'compact'，
+            // 新用户由 schema 默认建立，老用户早已迁移完成，无需保留此历史补丁。
             const has = key => Object.prototype.hasOwnProperty.call(overrides, key);
-            const font = has('font') ? overrides.font : GM_getValue('questionFont', '"Times New Roman", SimSun, "Songti SC", serif');
-            return {
-                mode: has('mode') ? overrides.mode : GM_getValue('printMode', 'q'),
-                font,
-                size: has('size') ? overrides.size : GM_getValue('questionSize', '16px'),
-                lineHeight: has('lineHeight') ? overrides.lineHeight : GM_getValue('questionLineHeight', '1.5'),
-                title: has('title') ? overrides.title : this.getPaperTitle(),
-                titleSize: has('titleSize') ? overrides.titleSize : GM_getValue('titleSize', '24px'),
-                pageFont: has('pageFont') ? overrides.pageFont : GM_getValue('pageFont', font),
-                pageSize: has('pageSize') ? overrides.pageSize : GM_getValue('pageSize', '12px'),
-                pageBold: has('pageBold') ? String(overrides.pageBold) !== 'false' : String(GM_getValue('pageBold', true)) !== 'false',
-                showPageNumber: has('showPageNumber') ? Boolean(overrides.showPageNumber) : Boolean(GM_getValue('showPageNumber', true)),
-                pageMargins: has('pageMargins') ? overrides.pageMargins : GM_getValue('pageMargins', '18,15,22,15'),
-                layoutPreset: has('layoutPreset') ? overrides.layoutPreset : GM_getValue('layoutPreset', 'exam'),
-                questionSpacing: has('questionSpacing') ? overrides.questionSpacing : GM_getValue('questionSpacing', '10'),
-                previewLayout: has('previewLayout') ? overrides.previewLayout : GM_getValue('previewLayout', 'double'),
-                previewZoom: has('previewZoom') ? overrides.previewZoom : GM_getValue('previewZoom', 'auto'),
-                paragraphSpacing: has('paragraphSpacing') ? overrides.paragraphSpacing : GM_getValue('paragraphSpacing', '8'),
-                contentAlign: has('contentAlign') ? overrides.contentAlign : GM_getValue('contentAlign', 'left'),
-                numberGap: has('numberGap') ? overrides.numberGap : GM_getValue('numberGap', '0.55'),
-                answerRowHeight: has('answerRowHeight') ? overrides.answerRowHeight : GM_getValue('answerRowHeight', '1.8'),
-                pageGap: has('pageGap') ? overrides.pageGap : GM_getValue('pageGap', '20'),
-                editorPanelWidth: has('editorPanelWidth') ? overrides.editorPanelWidth : GM_getValue('editorPanelWidth', '340'),
-                editorPanelTab: has('editorPanelTab') ? overrides.editorPanelTab : GM_getValue('editorPanelTab', 'document'),
-                editorOpen: has('editorOpen') ? Boolean(overrides.editorOpen) : String(GM_getValue('editorOpen', true)) !== 'false',
-                documentEdits: has('documentEdits') && overrides.documentEdits && typeof overrides.documentEdits === 'object'
-                    ? overrides.documentEdits
-                    : {},
-                readingAnchor: has('readingAnchor') && overrides.readingAnchor && typeof overrides.readingAnchor === 'object'
-                    ? overrides.readingAnchor
-                    : null
-            };
+            const result = {};
+            for (const s of PREVIEW_SETTING_SCHEMA) {
+                // undefined 的覆盖值视为"未提供"，回退到存储值/默认值，避免误杀 schema 默认（如 size 变空导致公式缩放漂移）
+                if (has(s.key) && overrides[s.key] !== undefined) {
+                    result[s.key] = overrides[s.key];
+                } else if (s.type === 'title') {
+                    result[s.key] = this.getPaperTitle();
+                } else {
+                    const stored = s.storage != null ? GM_getValue(s.storage, s.def) : s.def;
+                    result[s.key] = coerceSetting(s.type, stored, s.def);
+                }
+            }
+            // pageFont 缺省回退到 font
+            if (result.pageFont == null) result.pageFont = result.font;
+            // 非 schema 管理的复杂对象
+            result.documentEdits = has('documentEdits') && overrides.documentEdits && typeof overrides.documentEdits === 'object'
+                ? overrides.documentEdits
+                : {};
+            result.readingAnchor = has('readingAnchor') && overrides.readingAnchor && typeof overrides.readingAnchor === 'object'
+                ? overrides.readingAnchor
+                : null;
+            // 保证 layoutPreset 始终是已知预设键：脏值/空串（旧迁移残留、误写）一律回退到默认 'compact'，
+            // 避免首屏出现「实际是紧凑版式、UI 却显示自定义」的状态不一致。
+            if (!LAYOUT_PRESETS[result.layoutPreset]) result.layoutPreset = 'compact';
+            return result;
         }
 
         savePreviewSettings(settings = {}) {
-            const allowed = [
-                'mode', 'font', 'size', 'lineHeight', 'titleSize', 'pageFont', 'pageSize', 'pageBold',
-                'showPageNumber', 'pageMargins', 'layoutPreset', 'questionSpacing', 'previewLayout', 'previewZoom',
-                'paragraphSpacing', 'contentAlign', 'numberGap', 'answerRowHeight', 'pageGap',
-                'editorPanelWidth', 'editorPanelTab', 'editorOpen'
-            ];
-            allowed.forEach(key => {
-                if (!Object.prototype.hasOwnProperty.call(settings, key)) return;
-                GM_setValue(key === 'mode' ? 'printMode' : key, settings[key]);
-            });
+            for (const s of PREVIEW_SETTING_SCHEMA) {
+                if (!Object.prototype.hasOwnProperty.call(settings, s.key)) continue;
+                if (s.storage == null) continue; // title 等无存储项
+                const val = settings[s.key];
+                switch (s.type) {
+                    case 'csv': GM_setValue(s.storage, Array.isArray(val) ? val.join(',') : val); break;
+                    case 'boolStr': GM_setValue(s.storage, val ? 'true' : 'false'); break;
+                    case 'boolObj': GM_setValue(s.storage, Boolean(val)); break;
+                    default: GM_setValue(s.storage, val);
+                }
+            }
         }
 
         async openPreviewWithSettings(overrides = {}) {
-            const settings = this.getPreviewSettings(overrides);
-            this.savePreviewSettings(settings);
-            const includeQuestions = settings.mode !== 'a';
-            const includeAnswers = settings.mode === 'qa' || settings.mode === 'a';
-            const answersAtEnd = settings.mode === 'qe';
+            try {
+                // 重新打开新卷时清空公式基准缓存，避免不同试卷间共享公式 src 导致基准串味
+                resetFormulaBaseCache();
+                const settings = this.getPreviewSettings(overrides);
+                this.savePreviewSettings(settings);
+                const flags = settings.contentFlags || ['q'];
+                const includeQuestions = flags.includes('q');
+                const includeKnowledge = flags.includes('kp');
+                const includeAnswers = flags.includes('a');
+                const answersAtEnd = Boolean(settings.answersAtEnd);
+                const needAnswers = includeAnswers || answersAtEnd;
 
-            if (includeAnswers || answersAtEnd) {
-                this.triggerShowAnswers();
-                await this.waitForImages();
+                // [E3.1] 空试卷保护：当前页面未识别到任何题目时提示，避免静默生成空白预览
+                if (!document.querySelector('.sec-title, .questype-head .questypetitle, .tk-quest-item.quesroot')) {
+                    const msg = '当前页面未识别到题目，无法生成预览。请确认已在组卷网打开一份试卷。';
+                    if (typeof GM_notification === 'function') GM_notification({ text: msg, title: '组卷打印助手' });
+                    else alert(msg);
+                    return;
+                }
+
+                const baseOpts = {
+                    includeQ: includeQuestions, includeKP: includeKnowledge, includeA: false, atEnd: false,
+                    font: settings.font, size: settings.size, lineHeight: settings.lineHeight, title: settings.title,
+                    pageFont: settings.pageFont || settings.font, pageSize: settings.pageSize || '12px', pageBold: settings.pageBold,
+                    layoutOptions: settings
+                };
+
+                // 复用已打开的预览：不走 openPreview 重设 iframe.srcdoc（避免每次点击黑屏闪烁），
+                // 改为增量更新 sourceContent。仅当 overlay 不存在（首次打开）才整页注入 srcdoc。
+                // [E3.2] 首开时建立「就绪」承诺：iframe 首屏渲染完成（收到 zujuanPreviewRendered）后兑现，
+                // 答案注入前 await 它，避免 iframe 消息监听尚未注册导致增量消息丢失。
+                const existingOverlay = document.getElementById('zujuanjs-preview-overlay');
+                const existingIframe = existingOverlay && existingOverlay.querySelector('iframe.zujuanjs-preview-frame');
+                let previewReady;
+                if (existingIframe && existingIframe.contentWindow) {
+                    previewReady = Promise.resolve();
+                    const srcObj = this.generateSourceContentHTML(baseOpts);
+                    existingIframe.contentWindow.postMessage({ type: 'updateZujuanSource', token: PREVIEW_TOKEN, html: srcObj.html }, '*');
+                } else {
+                    this._previewReadyResolve = null;
+                    previewReady = new Promise(res => { this._previewReadyResolve = res; });
+                    // 兜底：最多等 3s，超时也继续注入，避免极端情况下永久卡住
+                    setTimeout(() => { if (this._previewReadyResolve) { this._previewReadyResolve(); this._previewReadyResolve = null; } }, SAFETY_TIMEOUT_MS);
+                    this.openPreview(this.generatePreviewHTML(baseOpts));
+                }
+
+                // 异步：若需要答案，先确认答案是否已在页面手动展开。
+                // [需求4] 不代点答案开关（避免消耗每日查看答案配额）：
+                //   - 已展开：等待答案图加载完成后注入；
+                //   - 未展开：提示用户先在组卷网点开「显示答案」，不注入空答案。
+                if (needAnswers) {
+                    if (!this.answersExpandedOnPage()) {
+                        if (typeof GM_notification === 'function') {
+                            GM_notification({ text: '预览未包含答案：请先在组卷网页面点开「显示答案」，再重新打开预览即可包含答案。', title: '组卷打印助手' });
+                        }
+                    } else {
+                        const answerImgCount = await this.waitForImages();
+                        // [E3.4] 原站无答案图时给出提示，避免静默缺答案
+                        if (answerImgCount === 0 && typeof GM_notification === 'function') {
+                            GM_notification({ text: '未在页面找到答案图片，可能需先在组卷网点开「显示答案」再预览。', title: '组卷打印助手' });
+                        }
+                        // [E3.2] 等 iframe 就绪（监听已注册）再发增量消息，否则消息会丢失
+                        if (previewReady) {
+                            try { await Promise.race([previewReady, new Promise(r => setTimeout(r, SAFETY_TIMEOUT_MS))]); } catch (e) { /* 忽略 */ }
+                        }
+                        try {
+                            const answerHtml = this.generateSourceContentHTML(Object.assign({}, baseOpts, { includeA: includeAnswers, atEnd: answersAtEnd }));
+                            const iframe = document.querySelector('#zujuanjs-preview-overlay iframe.zujuanjs-preview-frame');
+                            if (iframe && iframe.contentWindow) {
+                                iframe.contentWindow.postMessage({ type: 'updateZujuanSource', token: PREVIEW_TOKEN, html: answerHtml.html }, '*');
+                            }
+                        } catch (rebuildErr) {
+                            console.warn('[组卷打印] 答案增量注入失败（面板已显示，仅缺答案）:', rebuildErr);
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error('[组卷打印] 生成预览失败：', err);
+                const msg = '生成试卷预览失败：' + (err && err.message ? err.message : err);
+                if (typeof GM_notification === 'function') GM_notification({ text: msg, title: '组卷打印助手' });
+                else alert(msg);
             }
-
-            const htmlContent = this.generatePreviewHTML(
-                includeQuestions,
-                includeAnswers,
-                answersAtEnd,
-                settings.font,
-                settings.size,
-                settings.lineHeight,
-                settings.title,
-                settings.pageFont || settings.font,
-                settings.pageSize || '12px',
-                settings.pageBold,
-                settings
-            );
-            this.openPreview(htmlContent);
         }
 
         showPrintDialog() {
             this.openPreviewWithSettings();
         }
 
-        triggerShowAnswers() {
-            const cb = document.querySelector('#isshowAnswer');
-            if (cb && !cb.checked) cb.click();
-            const old = document.querySelector('.tklabel-checkbox.show-answer input');
-            if (old && !old.checked) old.click();
+        // [需求4] 不再自动点击答案开关：是否包含答案完全取决于用户在组卷网页面是否已手动展开答案。
+        // 自动点击会消耗站点每日查看答案配额，故脚本只做「检测」，绝不代点。
+        answersExpandedOnPage() {
+            const cb = document.querySelector(ANSWER_SWITCH_SEL);
+            if (cb) return cb.checked === true;
+            // 无显式答案开关时，退而判断答案区块是否已渲染实质内容（图片/矢量）
+            return !!document.querySelector('.exam-item__opt .item.answer img, .exam-item__opt .item.answer svg');
         }
 
-        waitForImages(timeout = 15000) {
+        // 答案/解析提取后按题目缓存，后续重建预览直接复用，不再触碰原页面
+        _getAnswerCache() {
+            if (!this._answerCache) this._answerCache = new Map();
+            return this._answerCache;
+        }
+        _cacheAnswerClone(wrap, clone) {
+            if (wrap && clone) this._getAnswerCache().set(wrap, clone);
+        }
+        _getCachedAnswerClone(wrap) {
+            return (wrap && this._getAnswerCache().has(wrap)) ? this._getAnswerCache().get(wrap) : null;
+        }
+
+        waitForImages(timeout = 4000) {
+            // 仅等待答案图片（异步注入）出现即可：一旦出现，克隆到预览 HTML 由 iframe 承载，
+            // iframe 内图片 onload 会自动重渲染分页，无需在此等待全部加载完成（避免首屏卡好几秒）。
             return new Promise(resolve => {
-                const imgs = Array.from(document.querySelectorAll('img')).filter(i => i.src.includes('getAnswerAndParse'));
-                if (imgs.length === 0) return resolve();
-                let loaded = 0;
-                const timer = setTimeout(() => resolve(), timeout);
-                const checkDone = () => { loaded++; if (loaded >= imgs.length) { clearTimeout(timer); resolve(); } };
-                imgs.forEach(img => {
-                    if (img.complete) checkDone();
-                    else { img.addEventListener('load', checkDone, { once: true }); img.addEventListener('error', checkDone, { once: true }); }
-                });
+                const start = Date.now();
+                const appearTimeout = 2500;
+                const finish = (count) => { resolve(count || 0); };
+                const tryWaitAppear = () => {
+                    const imgs = Array.from(document.querySelectorAll('img')).filter(i => i.src.includes('getAnswerAndParse'));
+                    if (imgs.length === 0) {
+                        if (Date.now() - start < appearTimeout) return setTimeout(tryWaitAppear, 150);
+                        return finish(0);
+                    }
+                    return finish(imgs.length);
+                };
+                tryWaitAppear();
             });
         }
 
         removeLeadingNumber(container) {
-            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
-            let node;
-            while (node = walker.nextNode()) {
-                if (node.textContent.match(/^\s*\d+\.\s*/)) {
-                    node.textContent = node.textContent.replace(/^\s*\d+\.\s*/, '');
-                    break;
+            // 题号位置规则（按页面类型）：先执行「元素删除」类规则，再执行「文本节点剥离」类规则（命中首个即停）。
+            // 组卷中心等页面把题号放在独立 .quesindex 元素里（如 <span class="quesindex">1．</span>）；
+            // 其余页面（试卷/章节/知识点）题号是文本节点开头的 "1." / "1 ." / 全角 "1．"，直接剥离。
+            const LEADING_NUMBER_RULES = [
+                { type: 'element', sel: '.quesindex' },
+                { type: 'text', pattern: /^\s*\d+\s*[.\uFF0E]\s*/ },
+            ];
+            for (const rule of LEADING_NUMBER_RULES) {
+                if (rule.type === 'element') {
+                    container.querySelectorAll(rule.sel).forEach(el => el.remove());
+                } else if (rule.type === 'text') {
+                    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null, false);
+                    let node;
+                    while (node = walker.nextNode()) {
+                        if (node.textContent.match(rule.pattern)) {
+                            node.textContent = node.textContent.replace(rule.pattern, '');
+                            break;
+                        }
+                    }
                 }
             }
+        }
+
+        extractKnowledgePoints(wrap, font, size) {
+            // 从 .exam-item__opt > .item.knowlegde > .knowledge-box 中提取知识点
+            const opt = wrap.querySelector('.exam-item__opt');
+            if (!opt) return null;
+            const kpItem = opt.querySelector('.item.knowlegde');
+            if (!kpItem) return null;
+            const kpBox = kpItem.querySelector('.knowledge-box');
+            if (!kpBox) return null;
+
+            const clone = kpBox.cloneNode(true);
+            // 移除"解读"按钮等交互元素
+            clone.querySelectorAll('.knowledge-explain, .btn_KnowledgeUnscramble').forEach(el => el.remove());
+
+            // 提取知识点名称文本
+            const names = Array.from(clone.querySelectorAll('.knowledge-name'))
+                .map(el => el.textContent.trim())
+                .filter(Boolean);
+            if (names.length === 0) return null;
+
+            const container = document.createElement('div');
+            container.className = 'zujuanjs-knowledge-points';
+            container.style.fontFamily = font;
+            container.style.fontSize = size;
+            container.style.marginTop = '6px';
+            // 用 DOM 节点拼接而非 innerHTML，杜绝来自页面 DOM 的 HTML 注入面
+            const titleSpan = document.createElement('span');
+            titleSpan.style.color = '#1677ff';
+            titleSpan.style.fontWeight = '600';
+            titleSpan.textContent = '【知识点】';
+            container.appendChild(titleSpan);
+            container.appendChild(document.createTextNode(' ' + names.join('、')));
+            return container;
         }
 
         isFormulaSvgImage(image) {
@@ -740,13 +818,36 @@
         }
 
         preparePreviewTypography(root) {
-            root.querySelectorAll('img').forEach(image => {
-                if (!this.isFormulaSvgImage(image)) return;
+            // 实时 DOM 中已布局的公式图（用于首渲冻结其真实尺寸）。只扫描题目容器，避免整页（含广告/头像）大数组分配，
+            // 也更贴合 rootFormulas 的来源（题目体来自 .wrapper.quesdiv），降低下标错位风险。
+            const liveFormulas = Array.from(document.querySelectorAll('.wrapper.quesdiv img')).filter(img => this.isFormulaSvgImage(img));
+            const rootFormulas = Array.from(root.querySelectorAll('img')).filter(img => this.isFormulaSvgImage(img));
+            rootFormulas.forEach((image, i) => {
                 image.classList.add('zujuanjs-formula-svg');
                 image.dataset.formulaBaseline = '14';
                 const pixelStyle = value => /^\s*\d+(?:\.\d+)?px\s*$/.test(value || '') ? Number.parseFloat(value) : 0;
-                const width = Number.parseFloat(image.getAttribute('width')) || pixelStyle(image.style.width);
-                const height = Number.parseFloat(image.getAttribute('height')) || pixelStyle(image.style.height);
+                const src = image.getAttribute('src') || '';
+                let width = Number.parseFloat(image.getAttribute('width')) || pixelStyle(image.style.width);
+                let height = Number.parseFloat(image.getAttribute('height')) || pixelStyle(image.style.height);
+                // 优先复用已冻结的基准（按 src，其次按序号），保证跨次重建尺寸稳定，不被原站重排版带偏。
+                const frozen = (src && _formulaBaseBySrc.get(src)) || _formulaBaseByIndex[i];
+                if (frozen && (frozen.width > 0 || frozen.height > 0)) {
+                    if (frozen.width > 0) width = frozen.width;
+                    if (frozen.height > 0) height = frozen.height;
+                } else {
+                    // 未冻结过：本次捕获并冻结（优先用实时 naturalWidth，否则用显式 width/height）
+                    if (width <= 0 && height <= 0) {
+                        const live = liveFormulas[i];
+                        if (live && live.naturalWidth > 0) {
+                            width = live.naturalWidth;
+                            if (live.naturalHeight > 0) height = live.naturalHeight;
+                        }
+                    }
+                    if (width > 0 || height > 0) {
+                        if (src) _formulaBaseBySrc.set(src, { width, height });
+                        _formulaBaseByIndex[i] = { width, height };
+                    }
+                }
                 if (Number.isFinite(width) && width > 0) image.dataset.formulaBaseWidth = String(width);
                 if (Number.isFinite(height) && height > 0) image.dataset.formulaBaseHeight = String(height);
             });
@@ -790,14 +891,15 @@
             });
         }
 
-        generatePreviewHTML(includeQ, includeA, atEnd, font, size, lineHeight, title, pageFont, pageSize, pageBold, layoutOptions = {}) {
+        generateSourceContentHTML(opts = {}) {
+            const { includeQ, includeKP, includeA, atEnd, font, size, lineHeight, title, pageFont, pageSize, pageBold, layoutOptions = {} } = opts;
             const marginValues = String(layoutOptions.pageMargins || '18,15,22,15')
                 .split(',')
                 .map(value => Number(value));
             const validMargins = marginValues.length === 4 && marginValues.every(value => Number.isFinite(value) && value >= 8 && value <= 55);
             const [marginTop, marginRight, marginBottom, marginLeft] = validMargins ? marginValues : [18, 15, 22, 15];
-            const contentWidth = 210 - marginLeft - marginRight;
-            const contentHeight = 297 - marginTop - marginBottom;
+            const contentWidth = A4.w - marginLeft - marginRight;
+            const contentHeight = A4.h - marginTop - marginBottom;
             const footerBottom = Math.max(5, Math.min(9, marginBottom / 3));
             const questionSpacing = Math.max(0, Math.min(32, Number(layoutOptions.questionSpacing) || 10));
             const previewLayout = layoutOptions.previewLayout === 'single' ? 'single' : 'double';
@@ -806,7 +908,7 @@
             const previewZoom = rawPreviewZoom === 'auto'
                 ? 'auto'
                 : String(Math.max(0.25, Math.min(2, Number.isFinite(numericPreviewZoom) ? numericPreviewZoom : 1)));
-            const titleSize = Math.max(18, Math.min(36, Number(layoutOptions.titleSize) || 24));
+            const titleSize = Math.max(18, Math.min(36, parseFloat(layoutOptions.titleSize) || 24));
             const showPageNumber = layoutOptions.showPageNumber !== false;
             const paragraphSpacing = Math.max(0, Math.min(24, Number(layoutOptions.paragraphSpacing) || 8));
             const contentAlign = ['left', 'justify'].includes(layoutOptions.contentAlign) ? layoutOptions.contentAlign : 'left';
@@ -822,14 +924,6 @@
             const readingAnchor = layoutOptions.readingAnchor && typeof layoutOptions.readingAnchor === 'object'
                 ? layoutOptions.readingAnchor
                 : null;
-            const previewSettingsJson = JSON.stringify({
-                mode: layoutOptions.mode || 'q', font, size, lineHeight, title, titleSize: `${titleSize}px`,
-                pageFont, pageSize, pageBold, showPageNumber, pageMargins: `${marginTop},${marginRight},${marginBottom},${marginLeft}`,
-                questionSpacing: String(questionSpacing), previewLayout, previewZoom,
-                paragraphSpacing: String(paragraphSpacing), contentAlign, numberGap: String(numberGap),
-                answerRowHeight: String(answerRowHeight), pageGap: String(pageGap),
-                editorPanelWidth: String(editorPanelWidth), editorPanelTab, editorOpen, documentEdits, readingAnchor
-            }).replace(/</g, '\\u003c');
             const tempDiv = document.createElement('div');
 
             const titleEl = document.createElement('div');
@@ -844,17 +938,34 @@
             const answersEndList = [];
             let questionIndex = 1;
 
-            document.querySelectorAll('.sec-title, .tk-quest-item.quesroot').forEach(node => {
-                if (node.classList.contains('sec-title')) {
-                    const span = node.querySelector('span');
-                    if (span) {
-                        const section = document.createElement('div');
-                        section.className = 'zujuanjs-section-title';
-                        section.style.fontFamily = font;
-                        section.textContent = span.textContent.trim();
-                        tempDiv.appendChild(section);
+            // 章节标题提取：兼容旧版 `.sec-title` 与当前版 `.questype-head .questypetitle`（左题目标题区）。
+            // 右侧「分组与排序」面板（.ques-type h3）是编辑视图，不属于打印内容，不取。
+            const appendSection = (text) => {
+                const section = document.createElement('div');
+                section.className = 'zujuanjs-section-title';
+                section.style.fontFamily = font;
+                section.textContent = text;
+                tempDiv.appendChild(section);
+            };
+
+            // 章节标题提取器注册表：新增页面类型只需追加一项 { sel, get }，无需改下方题目大分支。
+            // .sec-title 为试卷详情页（取内部 span）；.questypetitle 为组卷中心左标题区（拼 index+name）；
+            // 右侧「分组与排序」面板（.ques-type h3）属编辑视图，不取。
+            const SECTION_TITLE_EXTRACTORS = [
+                { sel: '.sec-title', get: n => { const s = n.querySelector('span'); return s ? s.textContent.trim() : ''; } },
+                { sel: '.questypetitle', get: n => {
+                    const idx = n.querySelector('.questypeindex');
+                    const name = n.querySelector('.questypename');
+                    return ((idx ? idx.textContent : '') + (name ? name.textContent : '')).trim();
+                } },
+            ];
+            document.querySelectorAll('.sec-title, .questype-head .questypetitle, .tk-quest-item.quesroot').forEach(node => {
+                for (const ex of SECTION_TITLE_EXTRACTORS) {
+                    if (node.matches(ex.sel)) {
+                        const t = ex.get(node);
+                        if (t) appendSection(t);
+                        return; // 命中标题提取器，不再走题目分支
                     }
-                    return;
                 }
 
                 const wrap = node.querySelector('.wrapper.quesdiv');
@@ -887,40 +998,98 @@
                         questionBody = document.createElement('div');
                         questionBody.className = 'zujuanjs-question-body';
                         questionBody.appendChild(cntClone);
+
+                        // 知识点提取（紧跟题干）
+                        if (includeKP) {
+                            const kpBox = this.extractKnowledgePoints(wrap, font, size);
+                            if (kpBox) questionBody.appendChild(kpBox);
+                        }
+
+                        questionLayout.appendChild(numSpan);
+                        questionLayout.appendChild(questionBody);
+                        qDiv.appendChild(questionLayout);
+                    }
+                } else if (includeKP) {
+                    // 不选试题但选知识点时，仍需创建容器来放知识点
+                    questionBody = document.createElement('div');
+                    questionBody.className = 'zujuanjs-question-body';
+                    const kpBox = this.extractKnowledgePoints(wrap, font, size);
+                    if (kpBox) {
+                        const numSpan = document.createElement('span');
+                        numSpan.className = 'zujuanjs-question-number';
+                        numSpan.textContent = `${questionIndex}.`;
+                        questionBody.appendChild(kpBox);
+                        const questionLayout = document.createElement('div');
+                        questionLayout.className = 'zujuanjs-question-layout';
                         questionLayout.appendChild(numSpan);
                         questionLayout.appendChild(questionBody);
                         qDiv.appendChild(questionLayout);
                     }
                 }
 
-                const opt = wrap.querySelector('.exam-item__opt');
+                const cachedOpt = this._getCachedAnswerClone(wrap);
+                const opt = cachedOpt || wrap.querySelector('.exam-item__opt');
                 if (opt) {
                     const optClone = opt.cloneNode(true);
+                    // 仅在答案区已就绪时才缓存（避免缓存未展开时的空壳，否则用户后续手动展开答案、
+                    // 重新打开预览时仍复用空壳，导致答案始终为空）。未就绪则每次重读实时 DOM。
+                    if (!cachedOpt) {
+                        const ansNode = optClone.querySelector('.item.answer');
+                        const ansReady = ansNode && (ansNode.querySelector('img, svg, canvas, table')
+                            || ansNode.textContent.replace(/\s/g, '').length > 2);
+                        if (ansReady) this._cacheAnswerClone(wrap, optClone);
+                    }
+                    // 知识点已在上面单独提取，这里移除避免重复
                     optClone.querySelector('.knowledge-box')?.remove();
+                    optClone.querySelector('.item.knowlegde')?.remove();
 
-                    if (includeA) {
-                        (questionBody || qDiv).appendChild(optClone);
-                    } else if (atEnd) {
+                    if (atEnd) {
+                        // 答案附末尾：无论是否内联，都把答案块放到试卷末尾（新页开始）
                         const answerWrap = document.createElement('div');
                         answerWrap.className = 'zujuanjs-answer-item';
                         answerWrap.style.fontFamily = font;
                         answerWrap.style.fontSize = size;
                         answerWrap.style.lineHeight = lineHeight;
-                        const answerHeader = document.createElement('div');
-                        answerHeader.className = 'zujuanjs-answer-title';
-                        answerHeader.style.fontFamily = font;
-                        answerHeader.textContent = `第 ${questionIndex} 题解析`;
-                        answerWrap.appendChild(answerHeader);
-                        answerWrap.appendChild(optClone);
 
-                        const ansWrapper = document.createElement('div');
-                        ansWrapper.className = 'q-wrapper';
-                        ansWrapper.dataset.blockId = `answer-${questionIndex}`;
-                        ansWrapper.dataset.blockLabel = `第 ${questionIndex} 题解析`;
-                        ansWrapper.tabIndex = 0;
-                        ansWrapper.setAttribute('aria-label', `第 ${questionIndex} 题解析`);
-                        ansWrapper.appendChild(answerWrap);
-                        answersEndList.push(ansWrapper);
+                        // 提取答案内容：优先 .item.answer，但必须验证其内有实质内容（图片或文字）
+                        // 组卷网答案多为整图烘焙（img），.item.answer 若只是空壳则降级取整段
+                        let extracted = false;
+                        const ansPart = optClone.querySelector('.item.answer');
+                        if (ansPart) {
+                            const ansHasImg = ansPart.querySelector('img, svg, canvas, table');
+                            const ansHasText = ansPart.textContent.replace(/\s/g, '').length > 2;
+                            if (ansHasImg || ansHasText) {
+                                answerWrap.appendChild(ansPart);
+                                extracted = true;
+                            }
+                        }
+                        if (!extracted) {
+                            // 降级：取整段 optClone（已移除知识点），确保图片答案不丢失
+                            answerWrap.appendChild(optClone);
+                        }
+
+                        // 答案为空（无实质文本或图片）则跳过，不保留空题号
+                        const hasRealContent = answerWrap.querySelector('img, svg, canvas, table')
+                            || answerWrap.textContent.replace(/\s/g, '').length > 2;
+                        if (!hasRealContent) { /* 空：不加入列表 */ } else {
+                            const answerHeader = document.createElement('div');
+                            answerHeader.className = 'zujuanjs-answer-title';
+                            answerHeader.style.fontFamily = font;
+                            answerHeader.textContent = `${questionIndex}. `;
+                            answerWrap.insertBefore(answerHeader, answerWrap.firstChild);
+
+                            const ansWrapper = document.createElement('div');
+                            ansWrapper.className = 'q-wrapper zujuanjs-answer-entry';
+                            ansWrapper.dataset.blockId = `answer-${questionIndex}`;
+                            ansWrapper.dataset.blockLabel = `第 ${questionIndex} 题答案`;
+                            ansWrapper.tabIndex = 0;
+                            ansWrapper.setAttribute('aria-label', `第 ${questionIndex} 题答案`);
+                            ansWrapper.appendChild(answerWrap);
+                            answersEndList.push(ansWrapper);
+                        }
+                    } else if (includeA) {
+                        // 勾选了答案（且未附末尾），整段放入（答案块）
+                        (questionBody || qDiv).appendChild(optClone);
                     }
                 }
 
@@ -930,10 +1099,19 @@
             });
 
             if (atEnd && answersEndList.length) {
+                // 1) 强制分页：题目结束后答案从新页开始
+                const breakEl = document.createElement('div');
+                breakEl.className = 'page-break zujuanjs-answers-break';
+                tempDiv.appendChild(breakEl);
+                // 2) "参考答案" 标题（居中加粗，打印时顶格显示）
                 const section = document.createElement('div');
-                section.className = 'zujuanjs-section-title';
+                section.className = 'zujuanjs-section-title zujuanjs-answers-header';
                 section.style.fontFamily = font;
-                section.textContent = '答案与解析';
+                section.style.textAlign = 'center';
+                section.style.borderLeft = 'none';
+                section.style.paddingLeft = '0';
+                section.style.fontSize = '1.4em';
+                section.textContent = '参考答案';
                 tempDiv.appendChild(section);
                 answersEndList.forEach(a => tempDiv.appendChild(a));
             }
@@ -944,8 +1122,46 @@
                 if (img.src) img.setAttribute('src', img.src);
             });
 
-            const contentHtml = tempDiv.innerHTML;
+            const contentFlags = Array.isArray(layoutOptions.contentFlags) ? layoutOptions.contentFlags : ['q'];
+            const answersAtEnd = Boolean(layoutOptions.answersAtEnd);
+            return {
+                html: tempDiv.innerHTML,
+                font, size, lineHeight, title, titleSize, pageFont, pageSize, pageBold,
+                showPageNumber, marginTop, marginRight, marginBottom, marginLeft,
+                questionSpacing, previewLayout, previewZoom, paragraphSpacing, contentAlign,
+                numberGap, answerRowHeight, pageGap, editorPanelWidth, editorPanelTab,
+                editorOpen, documentEdits, readingAnchor, contentFlags, answersAtEnd,
+                contentWidth, contentHeight, footerBottom
+            };
+        }
+
+        generatePreviewHTML(opts = {}) {
+            const src = this.generateSourceContentHTML(opts);
+            const { html: contentHtml, font, size, lineHeight, title, titleSize, pageFont, pageSize, pageBold, showPageNumber, marginTop, marginRight, marginBottom, marginLeft, questionSpacing, previewLayout, previewZoom, paragraphSpacing, contentAlign, numberGap, answerRowHeight, pageGap, editorPanelWidth, editorPanelTab, editorOpen, documentEdits, readingAnchor, contentFlags, answersAtEnd, contentWidth, contentHeight, footerBottom } = src;
+            const previewSettingsJson = JSON.stringify({
+                mode: 'q', font, size, lineHeight, title, titleSize: `${titleSize}px`,
+                pageFont, pageSize, pageBold, showPageNumber, pageMargins: `${marginTop},${marginRight},${marginBottom},${marginLeft}`,
+                questionSpacing: String(questionSpacing), previewLayout, previewZoom,
+                paragraphSpacing: String(paragraphSpacing), contentAlign, numberGap: String(numberGap),
+                answerRowHeight: String(answerRowHeight), pageGap: String(pageGap),
+                editorPanelWidth: String(editorPanelWidth), editorPanelTab, editorOpen, documentEdits, readingAnchor,
+                layoutPreset: (opts.layoutOptions && opts.layoutOptions.layoutPreset) || 'compact',
+                contentFlags, answersAtEnd,
+                autoCheckIn: GM_getValue('zujuanjsAutoCheckIn', false) === true,
+                selfCheck: GM_getValue('zujuanjsSelfCheck', false) === true,
+                layoutPresets: LAYOUT_PRESETS,
+                token: PREVIEW_TOKEN
+            }).replace(/</g, '\\u003c');
             const fontWeight = pageBold ? 'bold' : 'normal';
+
+            // 由内容块注册表驱动生成「打印内容」复选框（试题锁定置灰，其余可选）
+            const contentCheckboxesHtml = CONTENT_BLOCKS.map(b => {
+                const locked = b.locked;
+                const inputStyle = 'accent-color:#1677ff;width:14px;height:14px;' + (locked ? 'opacity:0.6;' : '');
+                const labelStyle = `display:inline-flex;align-items:center;gap:4px;cursor:${locked ? 'not-allowed' : 'pointer'};font-size:13px;color:${locked ? '#bbb' : '#434343'};`;
+                const attrs = locked ? ' checked disabled data-locked="1"' : '';
+                return `<label style="${labelStyle}"><input type="checkbox" name="setting-content" value="${b.key}" style="${inputStyle}"${attrs}>${b.label}</label>`;
+            }).join('');
 
             return `
             <!DOCTYPE html>
@@ -1049,12 +1265,15 @@
                         background: #fff; color: #ff4d4f; font-size: 12px; padding: 0 8px; white-space: nowrap;
                     }
 
-                    .zujuanjs-section-title { font-size: 1.25em; font-weight: bold; margin: 22px 0 12px; border-left: 4px solid #000; padding-left: 8px; page-break-inside: avoid; }
-                    .zujuanjs-print-title { font-size: 24px; text-align: center; font-weight: bold; margin: 15px 0 30px; line-height: 1.4; page-break-inside: avoid; }
+                    .zujuanjs-section-title { font-size: 1.25em; font-weight: bold; margin: 22px 0 12px; border-left: 4px solid #000; padding-left: 8px; page-break-inside: avoid; page-break-after: avoid; }
+                    /* 参考答案标题：强制从新页开始（打印模式） */
+                    .zujuanjs-answers-header { break-before: page; page-break-before: always; border-left: none; }
+                    .zujuanjs-print-title { font-size: var(--title-size, 24px); text-align: center; font-weight: bold; margin: 15px 0 30px; line-height: 1.4; page-break-inside: avoid; }
                     .zujuanjs-question { margin-bottom: 18px; padding: 4px 0; border-bottom: none; }
                     .zujuanjs-question-number { font-weight: bold; white-space: pre; }
                     .zujuanjs-answer-item { margin-bottom: 18px; padding: 4px 0; border: none; }
                     .zujuanjs-answer-title { font-weight: bold; margin-bottom: 6px; }
+                    .zujuanjs-knowledge-points { font-size: 0.9em; color: #555; line-height: 1.6; }
                     img { max-width: 100%; }
 
                     @media print {
@@ -1144,18 +1363,7 @@
                     .q-wrapper.continued-from-previous .zujuanjs-question,
                     .q-wrapper.continued-from-previous .zujuanjs-answer-item { padding-top: 0; }
                     .q-toolbar { top: -14px; }
-                    .manual-break-indicator {
-                        position: absolute;
-                        left: 0;
-                        right: 0;
-                        bottom: 0;
-                        border-bottom: 1px dashed #ff4d4f;
-                        color: #ff4d4f;
-                        font-size: 11px;
-                        line-height: 18px;
-                        text-align: center;
-                        pointer-events: none;
-                    }
+                    .manual-break-indicator { display: none; }
                     .preview-page-count { min-width: 52px; font-size: 12px; color: #d0d0d0; }
 
                     @media screen and (max-width: 850px) {
@@ -1484,6 +1692,13 @@
                     .zujuanjs-question-body > :first-child { margin-top: 0 !important; }
                     .zujuanjs-question-body > .exam-item__opt:last-child,
                     .zujuanjs-question-body > :last-child { margin-bottom: 0; }
+                    .zujuanjs-knowledge-points {
+                        grid-column: 1 / -1;
+                        font-size: 0.9em;
+                        color: var(--text-secondary, #888);
+                        line-height: 1.6;
+                        margin-top: 4px;
+                    }
                     @media screen and (max-width: 680px) {
                         .editor-panel {
                             top: auto;
@@ -1858,7 +2073,7 @@
                         overflow: hidden;
                         background: #45484b;
                     }
-                    body.question-tools-open .preview-workspace { top: 112px; }
+                    /* 题目工具栏已嵌入 preview-toolbar 内部，无需额外偏移 */
                     body.editor-open .preview-workspace {
                         grid-template-columns: minmax(0, 1fr) var(--editor-panel-width);
                     }
@@ -2368,43 +2583,32 @@
                     }
                     .editor-panel .editor-reset:hover,
                     .editor-panel .editor-reset:focus-visible { border-color: #93bbb0; background: #f4faf7; }
-                    .question-float-toolbar {
-                        border-color: #c9dbd5;
-                        background: #fdfefd;
-                        box-shadow: 0 10px 24px rgba(25,51,47,0.20);
-                    }
-                    .question-toolbar-label { color: var(--ui-text); }
-                    .question-float-toolbar .btn[aria-pressed="true"] {
-                        border-color: #75b9aa;
-                        color: #075e58;
-                        background: var(--ui-accent-soft);
-                    }
+                    /* 浅色主题：题目工具栏按钮已复用 .btn-outline-light，自动跟随左侧主题；此处仅保留危险按钮与计数框 */
+                    .question-float-toolbar .btn-outline-danger { color: #ff9b9b; border-color: rgba(217,54,62,0.5); }
+                    .question-float-toolbar .btn-outline-danger:hover,
+                    .question-float-toolbar .btn-outline-danger:focus-visible { color: #fff; border-color: #d9363e; background: #d9363e; }
                     .question-line-count {
-                        border-color: #d4dfdb;
-                        color: #53615d;
-                        background: #f2f6f4;
+                        border-color: var(--ui-border, #d4dfdb);
+                        color: var(--ui-text);
+                        background: transparent;
                     }
 
                     .question-float-toolbar {
-                        position: fixed;
-                        top: calc(var(--toolbar-height) + 8px);
-                        left: 8px;
-                        z-index: 2147483000;
                         display: flex;
-                        max-width: calc(100vw - 16px);
-                        min-height: 40px;
                         align-items: center;
                         gap: 6px;
-                        padding: 4px 6px;
+                        padding: 0 4px;
+                        min-height: var(--toolbar-height);
+                        height: 100%;
                         overflow-x: auto;
-                        border: 1px solid #cfd4da;
-                        border-radius: 6px;
-                        background: #fff;
-                        box-shadow: 0 6px 20px rgba(0,0,0,0.22);
+                        scrollbar-width: none;
+                        border-radius: 0;
+                        border: none;
+                        background: transparent;
+                        box-shadow: none;
                         opacity: 0;
                         visibility: hidden;
                         pointer-events: none;
-                        scrollbar-width: none;
                         transition: opacity 0.12s ease;
                     }
                     .question-float-toolbar::-webkit-scrollbar { display: none; }
@@ -2413,49 +2617,47 @@
                         visibility: visible;
                         pointer-events: auto;
                     }
+                    /* 题目工具栏容器：未激活时隐藏整个中间区域 */
+                    #question-toolbar-section:not(:has(.is-visible)) {
+                        display: none;
+                    }
                     .question-toolbar-label {
-                        max-width: 94px;
                         overflow: hidden;
-                        color: #34383d;
+                        color: #d6d9dc;
                         font-size: 12px;
-                        font-weight: 650;
+                        font-weight: 600;
                         text-overflow: ellipsis;
                         white-space: nowrap;
+                        max-width: 80px;
                     }
                     .question-float-toolbar .btn-group { flex: 0 0 auto; }
-                    .question-float-toolbar .btn {
-                        display: inline-flex;
-                        height: 32px;
-                        min-height: 32px;
-                        align-items: center;
-                        justify-content: center;
-                        padding: 0 9px;
-                        border-radius: 4px;
-                        font-size: 11px;
-                        font-weight: 600;
-                        line-height: 1;
-                        letter-spacing: 0;
-                        white-space: nowrap;
+                    /* 常规按钮直接复用左侧 .btn-outline-light：同款描边/底色/字体色/hover/按下阴影，零重复 */
+                    .question-float-toolbar .btn:focus-visible { outline: 2px solid #69b1ff; outline-offset: 1px; }
+                    /* 清除按钮保留危险语义，但视觉语言与工具栏一致 */
+                    .question-float-toolbar .btn-outline-danger {
+                        color: #ff9b9b;
+                        border-color: #6e3a3c;
+                        background: transparent;
                     }
-                    .question-float-toolbar .btn[aria-pressed="true"] {
-                        border-color: #1677ff;
-                        color: #0f5fc4;
-                        background: #eaf3ff;
+                    .question-float-toolbar .btn-outline-danger:hover,
+                    .question-float-toolbar .btn-outline-danger:focus-visible {
+                        color: #fff;
+                        border-color: #d9363e;
+                        background: #d9363e;
                     }
-                    .question-float-toolbar .btn:focus-visible { outline: 2px solid #1677ff; outline-offset: 1px; }
                     .question-float-toolbar .btn-outline-danger > span[aria-hidden="true"] { display: none; }
                     .question-toolbar-short-label { display: none; }
                     .question-line-count {
                         display: inline-flex;
-                        width: 52px;
-                        height: 32px;
+                        width: 48px;
+                        height: 34px;
                         align-items: center;
                         justify-content: center;
-                        border-top: 1px solid #dee2e6;
-                        border-bottom: 1px solid #dee2e6;
-                        color: #4f555b;
-                        background: #f8f9fa;
-                        font-size: 11px;
+                        border-top: 1px solid #45484b;
+                        border-bottom: 1px solid #45484b;
+                        color: #d6d9dc;
+                        background: transparent;
+                        font-size: 12px;
                         font-variant-numeric: tabular-nums;
                         white-space: nowrap;
                     }
@@ -2494,19 +2696,14 @@
                             padding-bottom: calc(min(72dvh, 620px) + 24px) !important;
                         }
                         .question-float-toolbar {
-                            top: calc(var(--toolbar-height) + 8px) !important;
-                            right: 8px;
-                            left: 8px !important;
-                            max-width: none;
                             min-height: 52px;
-                            padding: 4px;
+                            padding: 0 4px;
                             gap: 4px;
                         }
-                        .question-float-toolbar .btn { height: 44px; min-height: 44px; padding: 0 10px; }
-                        .question-line-count { height: 44px; }
+                        .question-float-toolbar .btn { height: 40px; min-height: 40px; padding: 0 10px; font-weight: 500; }
+                        .question-line-count { height: 40px; }
                         .question-toolbar-label { display: none; }
                         body.editor-open .question-float-toolbar { display: none !important; }
-                        body.question-tools-open .preview-workspace { top: 132px; }
                     }
                     @media screen and (max-width: 390px) {
                         .question-float-toolbar .btn { width: 40px; min-width: 40px; padding: 0; }
@@ -2562,19 +2759,33 @@
                             <button type="button" class="btn btn-outline-light" data-layout="single" title="单页预览" aria-label="单页预览"><svg class="toolbar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 1.5A1.5 1.5 0 0 1 4.5 0h7A1.5 1.5 0 0 1 13 1.5v13a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 3 14.5v-13ZM4.5 1a.5.5 0 0 0-.5.5v13a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5v-13a.5.5 0 0 0-.5-.5h-7Z"/></svg><span class="layout-label">单页</span></button>
                             <button type="button" class="btn btn-outline-light" data-layout="double" title="双页并排" aria-label="双页并排"><svg class="toolbar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h4A1.5 1.5 0 0 1 8 2.5v11A1.5 1.5 0 0 1 6.5 15h-4A1.5 1.5 0 0 1 1 13.5v-11ZM2.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-4ZM8 2.5A1.5 1.5 0 0 1 9.5 1h4A1.5 1.5 0 0 1 15 2.5v11a1.5 1.5 0 0 1-1.5 1.5h-4A1.5 1.5 0 0 1 8 13.5v-11ZM9.5 2a.5.5 0 0 0-.5.5v11a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-11a.5.5 0 0 0-.5-.5h-4Z"/></svg><span class="layout-label">双页</span></button>
                         </div>
-                        <span class="preview-page-count" id="preview-page-count" aria-live="polite" aria-atomic="true">排版中…</span>
-                    </div>
-                    <div class="toolbar-section">
                         <div class="zoom-control btn-group btn-group-sm" role="group" aria-label="预览缩放">
                             <button type="button" class="btn btn-outline-light" data-zoom="out" title="缩小" aria-label="缩小">−</button>
                             <button type="button" class="btn btn-outline-light zoom-value" id="zoom-value" data-zoom="auto" title="自动适应">自动</button>
                             <button type="button" class="btn btn-outline-light" data-zoom="in" title="放大" aria-label="放大">+</button>
                         </div>
+                        <span class="preview-page-count" id="preview-page-count" aria-live="polite" aria-atomic="true">排版中…</span>
+                    </div>
+                    <div class="toolbar-section" id="question-toolbar-section">
+                        <div class="question-float-toolbar" id="question-float-toolbar" role="toolbar" aria-label="当前题目排版工具" aria-hidden="true" data-active-block-id="">
+                            <span class="question-toolbar-label" id="question-toolbar-label">当前题目</span>
+                            <div class="btn-group btn-group-sm" role="group" aria-label="答题行数">
+                                <button type="button" class="btn btn-outline-light" data-question-action="remove-line" title="减少一行答题空间" aria-label="减少一行答题空间">−</button>
+                                <span class="question-line-count" id="question-line-count" aria-live="polite">0 行</span>
+                                <button type="button" class="btn btn-outline-light" data-question-action="add-line" title="增加一行答题空间" aria-label="增加一行答题空间">+</button>
+                            </div>
+                            <button type="button" class="btn btn-outline-light" data-question-action="add-lines" title="增加四行答题空间">+4行</button>
+                            <div class="btn-group btn-group-sm" role="group" aria-label="手动分页">
+                                <button type="button" class="btn btn-outline-light" data-question-action="break-before" aria-label="在本题前分页" aria-pressed="false"><span class="question-toolbar-wide-label">前分页</span><span class="question-toolbar-short-label" aria-hidden="true">前</span></button>
+                                <button type="button" class="btn btn-outline-light" data-question-action="break-after" aria-label="在本题后分页" aria-pressed="false"><span class="question-toolbar-wide-label">后分页</span><span class="question-toolbar-short-label" aria-hidden="true">后</span></button>
+                            </div>
+                            <button type="button" class="btn btn-outline-danger" data-question-action="clear" title="清除本题留白和分页"><span class="question-toolbar-wide-label">清除</span><span aria-hidden="true">×</span></button>
+                        </div>
                     </div>
                     <div class="toolbar-section">
                         <button type="button" class="btn btn-outline-light btn-sm editor-toggle" id="editor-toggle" title="排版工具" aria-label="排版工具" aria-controls="editor-panel" aria-expanded="false"><svg class="toolbar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M9.405 1.05c-.413-1.4-2.397-1.4-2.81 0l-.1.34a1.47 1.47 0 0 1-2.105.872l-.31-.17c-1.283-.698-2.686.705-1.987 1.987l.169.311c.446.82.023 1.841-.872 2.105l-.34.1c-1.4.413-1.4 2.397 0 2.81l.34.1a1.47 1.47 0 0 1 .872 2.105l-.17.31c-.698 1.283.705 2.686 1.987 1.987l.311-.169a1.47 1.47 0 0 1 2.105.872l.1.34c.413 1.4 2.397 1.4 2.81 0l.1-.34a1.47 1.47 0 0 1 2.105-.872l.31.17c1.283.698 2.686-.705 1.987-1.987l-.169-.311a1.47 1.47 0 0 1 .872-2.105l.34-.1c1.4-.413 1.4-2.397 0-2.81l-.34-.1a1.47 1.47 0 0 1-.872-2.105l.17-.31c.698-1.283-.705-2.686-1.987-1.987l-.311.169a1.47 1.47 0 0 1-2.105-.872l-.1-.34ZM8 10.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5Z"/></svg></button>
                         <button type="button" class="btn btn-primary btn-sm print-action" onclick="window.print()" title="打印"><svg class="toolbar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 1a2 2 0 0 0-2 2v2h2V3h6v2h2V3a2 2 0 0 0-2-2H5Zm-1 9h8v5H4v-5Zm1 1v3h6v-3H5ZM2 5a2 2 0 0 0-2 2v4a2 2 0 0 0 2 2h1V9h10v4h1a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H2Zm11 2.25a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0Z"/></svg><span class="print-action-label">打印</span></button>
-                        <button type="button" class="btn btn-outline-light btn-sm close" title="关闭预览" aria-label="关闭预览" onclick="window.parent.postMessage({type: 'closeZujuanPreview'}, '*')"><svg class="toolbar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.146 4.146a.5.5 0 0 1 .708 0L8 7.293l3.146-3.147a.5.5 0 0 1 .708.708L8.707 8l3.147 3.146a.5.5 0 0 1-.708.708L8 8.707l-3.146 3.147a.5.5 0 0 1-.708-.708L7.293 8 4.146 4.854a.5.5 0 0 1 0-.708Z"/></svg></button>
+                        <button type="button" class="btn btn-outline-light btn-sm close" title="关闭预览" aria-label="关闭预览" onclick="window.parent.postMessage({type: 'closeZujuanPreview', token: PREVIEW_TOKEN}, '*')"><svg class="toolbar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.146 4.146a.5.5 0 0 1 .708 0L8 7.293l3.146-3.147a.5.5 0 0 1 .708.708L8.707 8l3.147 3.146a.5.5 0 0 1-.708.708L8 8.707l-3.146 3.147a.5.5 0 0 1-.708-.708L7.293 8 4.146 4.854a.5.5 0 0 1 0-.708Z"/></svg></button>
                     </div>
                 </div>
                 <div id="source-content" style="font-family: ${font}; font-size: ${size}; line-height: ${lineHeight};">${contentHtml}</div>
@@ -2586,7 +2797,6 @@
                         <div class="editor-resize-handle" id="editor-resize-handle" role="separator" tabindex="0" aria-label="调整排版工具宽度" aria-orientation="vertical" aria-valuemin="280" aria-valuemax="520" aria-valuenow="${Math.round(editorPanelWidth)}"></div>
                         <div class="editor-panel-header">
                             <div class="editor-panel-title"><span>排版工具</span><small class="editor-save-status" id="editor-save-status" aria-live="polite">已自动保存</small></div>
-                            <button type="button" class="btn btn-light btn-sm" id="editor-close" title="收起" aria-label="收起排版工具">×</button>
                         </div>
                         <div class="editor-tablist" role="tablist" aria-label="排版类别">
                             <button type="button" class="btn" id="editor-tab-document" role="tab" data-editor-tab="document" aria-controls="editor-pane-document">文档</button>
@@ -2598,7 +2808,15 @@
                                     <div class="editor-section-title">内容</div>
                                     <div class="editor-grid">
                                         <label class="editor-field wide">打印内容
-                                            <select class="form-select form-select-sm" id="setting-mode"><option value="q">仅试题</option><option value="qa">试题与答案</option><option value="qe">答案附末尾</option><option value="a">仅答案</option></select>
+                                            <div style="display:flex;flex-wrap:nowrap;align-items:center;gap:6px 12px;padding:8px 0;">
+                                                ${contentCheckboxesHtml}
+                                                <span style="width:1px;height:14px;background:#ddd;margin:0 2px;"></span>
+                                                <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:13px;color:#434343;"><input type="checkbox" id="setting-answers-at-end" style="accent-color:#1677ff;width:14px;height:14px;">答案附末尾</label>
+                                            </div>
+                                            <div style="display:flex;flex-wrap:nowrap;align-items:center;gap:6px 12px;padding:12px 0 0;border-top:1px solid #f0f0f0;">
+                                                <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:13px;color:#888;"><input type="checkbox" id="setting-auto-checkin" style="accent-color:#1677ff;width:14px;height:14px;">自动签到</label>
+                                                <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:13px;color:#888;"><input type="checkbox" id="setting-self-check" style="accent-color:#1677ff;width:14px;height:14px;">自检模式</label>
+                                            </div>
                                         </label>
                                         <label class="editor-field wide">试卷标题<input class="form-control form-control-sm" id="setting-title" type="text"></label>
                                         <label class="editor-field">标题字号<select class="form-select form-select-sm" id="setting-title-size"><option value="20px">20px</option><option value="24px">24px</option><option value="28px">28px</option><option value="32px">32px</option></select></label>
@@ -2608,9 +2826,9 @@
                                 <section class="editor-section">
                                     <div class="editor-section-title">正文</div>
                                     <div class="editor-grid">
-                                        <label class="editor-field wide">字体<select class="form-select form-select-sm" id="setting-font"><option value='"Times New Roman", SimSun, "Songti SC", serif'>宋体 + 新罗马</option><option value='SimSun, "Songti SC", serif'>宋体</option><option value='"Microsoft YaHei", "PingFang SC", sans-serif'>微软雅黑</option><option value='SimHei, "PingFang SC", sans-serif'>黑体</option><option value='KaiTi, "Songti SC", serif'>楷体</option></select></label>
-                                        <label class="editor-field">字号<select class="form-select form-select-sm" id="setting-size"><option value="14px">14px</option><option value="16px">16px</option><option value="18px">18px</option><option value="20px">20px</option><option value="22px">22px</option></select></label>
-                                        <label class="editor-field">行距<select class="form-select form-select-sm" id="setting-line-height"><option value="1.2">1.2</option><option value="1.35">1.35</option><option value="1.5">1.5</option><option value="1.75">1.75</option><option value="2">2.0</option></select></label>
+                                        <label class="editor-field wide">字体<select class="form-select form-select-sm" id="setting-font">${buildSelectOptions(FONT_OPTIONS)}</select></label>
+                                        <label class="editor-field">字号<select class="form-select form-select-sm" id="setting-size">${buildSelectOptions(SIZE_OPTIONS)}</select></label>
+                                        <label class="editor-field">行距<select class="form-select form-select-sm" id="setting-line-height">${buildSelectOptions(LINE_HEIGHT_OPTIONS)}</select></label>
                                         <label class="editor-field editor-field-unit">段间距<input class="form-control form-control-sm" id="setting-paragraph-spacing" type="number" min="0" max="24" step="1"><span>px</span></label>
                                         <label class="editor-field">对齐<select class="form-select form-select-sm" id="setting-align"><option value="left">左对齐</option><option value="justify">两端对齐</option></select></label>
                                         <label class="editor-field editor-field-unit wide">题号间距<input class="form-control form-control-sm" id="setting-number-gap" type="number" min="0.2" max="2" step="0.05"><span>em</span></label>
@@ -2650,38 +2868,28 @@
                                     <div class="editor-section-title">页码</div>
                                     <div class="editor-grid">
                                         <label class="editor-check wide"><input class="form-check-input" id="setting-page-number" type="checkbox">显示页码</label>
-                                        <label class="editor-field wide">字体<select class="form-select form-select-sm" id="setting-page-font"><option value='"Times New Roman", SimSun, "Songti SC", serif'>宋体 + 新罗马</option><option value='SimSun, "Songti SC", serif'>宋体</option><option value='"Microsoft YaHei", "PingFang SC", sans-serif'>微软雅黑</option><option value='SimHei, "PingFang SC", sans-serif'>黑体</option></select></label>
-                                        <label class="editor-field">字号<select class="form-select form-select-sm" id="setting-page-size"><option value="10px">10px</option><option value="12px">12px</option><option value="14px">14px</option><option value="16px">16px</option></select></label>
+                                        <label class="editor-field wide">字体<select class="form-select form-select-sm" id="setting-page-font">${buildSelectOptions(FONT_OPTIONS)}</select></label>
+                                        <label class="editor-field">字号<select class="form-select form-select-sm" id="setting-page-size">${buildSelectOptions(PAGE_SIZE_OPTIONS)}</select></label>
                                         <label class="editor-check"><input class="form-check-input" id="setting-page-bold" type="checkbox">加粗</label>
                                     </div>
                                 </section>
                             </div>
                         </div>
                         <div class="editor-panel-footer">
-                            <button type="button" class="editor-reset btn btn-outline-secondary btn-sm w-100" id="editor-reset">恢复考试默认</button>
+                            <button type="button" class="editor-reset btn btn-outline-secondary btn-sm w-100" id="editor-reset">恢复默认</button>
                         </div>
                     </aside>
                 </div>
-                <div class="question-float-toolbar" id="question-float-toolbar" role="toolbar" aria-label="当前题目排版工具" aria-hidden="true" data-active-block-id="">
-                    <span class="question-toolbar-label" id="question-toolbar-label">当前题目</span>
-                    <div class="btn-group btn-group-sm" role="group" aria-label="答题行数">
-                        <button type="button" class="btn btn-outline-secondary" data-question-action="remove-line" title="减少一行答题空间" aria-label="减少一行答题空间">−</button>
-                        <span class="question-line-count" id="question-line-count" aria-live="polite">0 行</span>
-                        <button type="button" class="btn btn-outline-secondary" data-question-action="add-line" title="增加一行答题空间" aria-label="增加一行答题空间">+</button>
-                    </div>
-                    <button type="button" class="btn btn-outline-secondary" data-question-action="add-lines" title="增加四行答题空间">+4行</button>
-                    <div class="btn-group btn-group-sm" role="group" aria-label="手动分页">
-                        <button type="button" class="btn btn-outline-secondary" data-question-action="break-before" aria-label="在本题前分页" aria-pressed="false"><span class="question-toolbar-wide-label">前分页</span><span class="question-toolbar-short-label" aria-hidden="true">前</span></button>
-                        <button type="button" class="btn btn-outline-secondary" data-question-action="break-after" aria-label="在本题后分页" aria-pressed="false"><span class="question-toolbar-wide-label">后分页</span><span class="question-toolbar-short-label" aria-hidden="true">后</span></button>
-                    </div>
-                    <button type="button" class="btn btn-outline-danger" data-question-action="clear" title="清除本题留白和分页"><span class="question-toolbar-wide-label">清除</span><span aria-hidden="true">×</span></button>
-                </div>
                 <script>
+                    const PREVIEW_TOKEN = ${JSON.stringify(PREVIEW_TOKEN)};
+                    const A4 = { w: 210, h: 297 };
+                    // 分页循环上限：与父窗口 MAX_PAGINATE_ITER 同源（iframe 为沙箱隔离作用域，无法访问父级常量）
+                    const MAX_PAGINATE_ITER = ${MAX_PAGINATE_ITER};
                     const sourceContent = document.getElementById('source-content');
                     const paperContainer = document.getElementById('paper-container');
                     const pageViewport = document.getElementById('page-viewport');
-                    const paperWidthPx = 210 * (96 / 25.4);
-                    const paperHeightPx = 297 * (96 / 25.4);
+                    const paperWidthPx = A4.w * (96 / 25.4);
+                    const paperHeightPx = A4.h * (96 / 25.4);
                     const zoomSteps = [0.25, 0.33, 0.4, 0.5, 0.65, 0.8, 1, 1.25, 1.5, 2];
                     const overflowTolerance = 0.75;
                     const previewSettings = ${previewSettingsJson};
@@ -2691,23 +2899,8 @@
                     const questionToolbar = document.getElementById('question-float-toolbar');
                     const editorSaveStatus = document.getElementById('editor-save-status');
                     const layoutPresetNote = document.getElementById('layout-preset-note');
-                    const layoutPresets = Object.freeze({
-                        exam: {
-                            label: '考试标准',
-                            settings: {
-                                font: '"Times New Roman", SimSun, "Songti SC", serif', size: '16px', lineHeight: '1.5',
-                                titleSize: '24px', pageFont: '"Times New Roman", SimSun, "Songti SC", serif', pageSize: '12px',
-                                pageBold: true, showPageNumber: true, pageMargins: '18,15,22,15', questionSpacing: '10',
-                                paragraphSpacing: '8', contentAlign: 'left', numberGap: '0.55', answerRowHeight: '1.8', pageGap: '20',
-                                previewLayout: 'double', previewZoom: 'auto'
-                            }
-                        },
-                        'word-normal': { label: 'Word 普通', settings: { pageMargins: '25.4,25.4,25.4,25.4' } },
-                        'word-narrow': { label: 'Word 窄', settings: { pageMargins: '12.7,12.7,12.7,12.7' } },
-                        'word-moderate': { label: 'Word 适中', settings: { pageMargins: '25.4,19.05,25.4,19.05' } },
-                        'word-wide': { label: 'Word 宽', settings: { pageMargins: '25.4,50.8,25.4,50.8' } },
-                        compact: { label: '紧凑省纸', settings: { pageMargins: '12,12,16,12', questionSpacing: '4', paragraphSpacing: '4', lineHeight: '1.35' } }
-                    });
+                    // 版式预设来自父窗口注入的单一来源（LAYOUT_PRESETS），与脚本定义保持一致
+                    const layoutPresets = previewSettings.layoutPresets;
                     let currentLayout = previewSettings.previewLayout;
                     let currentZoom = previewSettings.previewZoom;
                     let currentScale = 1;
@@ -2731,9 +2924,11 @@
                     }
 
                     function updateLayoutPresetUI() {
-                        const requested = layoutPresets[previewSettings.layoutPreset] ? previewSettings.layoutPreset : 'custom';
+                        // 以用户当前选择的版式为准；脏值/空串回退到默认 'compact'（与父窗口归一逻辑一致）
+                        const requested = layoutPresets[previewSettings.layoutPreset] ? previewSettings.layoutPreset : 'compact';
                         const preset = layoutPresets[requested];
                         const matchesPreset = preset && Object.entries(preset.settings).every(([key, value]) => String(previewSettings[key]) === String(value));
+                        // 所选版式与当前各项设置仍一致→高亮该版式；已偏离→归为自定义
                         const activePreset = matchesPreset ? requested : 'custom';
                         document.querySelectorAll('[data-layout-preset]').forEach(button => {
                             const active = button.dataset.layoutPreset === activePreset;
@@ -2748,7 +2943,7 @@
                     }
 
                     function savePreviewPreference(key, value) {
-                        window.parent.postMessage({ type: 'saveZujuanPreviewPreference', key: key, value: String(value) }, '*');
+                        window.parent.postMessage({ type: 'saveZujuanPreviewPreference', key: key, value: String(value), token: PREVIEW_TOKEN }, '*');
                     }
 
                     function savePrintSettings() {
@@ -2756,7 +2951,7 @@
                         previewSettings.editorPanelWidth = String(currentPanelWidth);
                         previewSettings.editorPanelTab = currentEditorTab;
                         previewSettings.editorOpen = editorOpen;
-                        window.parent.postMessage({ type: 'saveZujuanPrintSettings', settings: previewSettings }, '*');
+                        window.parent.postMessage({ type: 'saveZujuanPrintSettings', settings: previewSettings, token: PREVIEW_TOKEN }, '*');
                         setSaveStatus('已自动保存');
                     }
 
@@ -2855,7 +3050,14 @@
 
                     function writeSettingsToEditor() {
                         const margins = String(previewSettings.pageMargins).split(',');
-                        setSelectValue('setting-mode', previewSettings.mode);
+                        // 设置打印内容多选框
+                        const flags = previewSettings.contentFlags || (previewSettings.mode === 'a' ? ['a'] : ['q']);
+                        document.querySelectorAll('input[name="setting-content"]').forEach(cb => {
+                            if (cb.dataset.locked) { cb.checked = true; cb.disabled = true; return; }
+                            cb.checked = flags.includes(cb.value);
+                        });
+                        const atEndCb = document.getElementById('setting-answers-at-end');
+                        if (atEndCb) atEndCb.checked = Boolean(previewSettings.answersAtEnd);
                         document.getElementById('setting-title').value = previewSettings.title || '';
                         setSelectValue('setting-title-size', previewSettings.titleSize);
                         document.getElementById('setting-spacing').value = previewSettings.questionSpacing;
@@ -2874,13 +3076,20 @@
                         setSelectValue('setting-page-font', previewSettings.pageFont);
                         setSelectValue('setting-page-size', previewSettings.pageSize);
                         document.getElementById('setting-page-bold').checked = Boolean(previewSettings.pageBold);
+                        const autoCb = document.getElementById('setting-auto-checkin');
+                        if (autoCb) autoCb.checked = Boolean(previewSettings.autoCheckIn);
+                        const selfCb = document.getElementById('setting-self-check');
+                        if (selfCb) selfCb.checked = Boolean(previewSettings.selfCheck);
                         updateLayoutPresetUI();
                     }
 
                     function readSettingsFromEditor() {
                         const margin = side => clamp(document.getElementById('setting-margin-' + side).value, 8, 55, 15);
+                        const contentChecks = document.querySelectorAll('input[name="setting-content"]:checked');
+                        const contentFlags = Array.from(contentChecks).map(el => el.value);
                         return {
-                            mode: document.getElementById('setting-mode').value,
+                            contentFlags,
+                            answersAtEnd: document.getElementById('setting-answers-at-end')?.checked || false,
                             title: document.getElementById('setting-title').value.trim(),
                             titleSize: document.getElementById('setting-title-size').value,
                             questionSpacing: String(clamp(document.getElementById('setting-spacing').value, 0, 32, 10)),
@@ -2924,7 +3133,7 @@
 
                     function applyFormulaScale() {
                         const ratio = clamp(Number.parseFloat(previewSettings.size) / 14, 0.65, 2.2, 1);
-                        document.documentElement.style.setProperty('--formula-scale', String(ratio));
+                        // 注：公式缩放实际依赖下方逐图 image.style.width 内联，无需 --formula-scale 变量（全局 CSS 也未引用）。
                         sourceContent.querySelectorAll('img.zujuanjs-formula-svg').forEach(image => {
                             let baseWidth = Number.parseFloat(image.dataset.formulaBaseWidth);
                             let baseHeight = Number.parseFloat(image.dataset.formulaBaseHeight);
@@ -2949,8 +3158,8 @@
                     function applyDocumentStyles() {
                         const margins = String(previewSettings.pageMargins).split(',').map(value => clamp(value, 8, 55, 15));
                         const top = margins[0], right = margins[1], bottom = margins[2], left = margins[3];
-                        const contentWidth = 210 - left - right;
-                        const contentHeight = 297 - top - bottom;
+                        const contentWidth = A4.w - left - right;
+                        const contentHeight = A4.h - top - bottom;
                         const root = document.documentElement;
                         root.style.setProperty('--question-font', previewSettings.font);
                         root.style.setProperty('--question-size', previewSettings.size);
@@ -2967,7 +3176,7 @@
                         root.style.setProperty('--page-image-max-height', Math.max(20, contentHeight - 12) + 'mm');
                         root.style.setProperty('--page-footer-bottom', Math.max(5, Math.min(9, bottom / 3)) + 'mm');
                         root.style.setProperty('--question-spacing', clamp(previewSettings.questionSpacing, 0, 32, 10) + 'px');
-                        root.style.setProperty('--title-size', clamp(previewSettings.titleSize, 18, 36, 24) + 'px');
+                        root.style.setProperty('--title-size', Math.max(18, Math.min(36, parseFloat(previewSettings.titleSize) || 24)) + 'px');
                         root.style.setProperty('--paragraph-spacing', clamp(previewSettings.paragraphSpacing, 0, 24, 8) + 'px');
                         root.style.setProperty('--number-gap', clamp(previewSettings.numberGap, 0.2, 2, 0.55) + 'em');
                         root.style.setProperty('--answer-row-height', clamp(previewSettings.answerRowHeight, 1, 6, 1.8) + 'em');
@@ -2979,6 +3188,7 @@
                             title.textContent = previewSettings.title || '';
                             title.style.display = previewSettings.title ? '' : 'none';
                             title.style.fontFamily = previewSettings.font;
+                            title.style.fontSize = Math.max(18, Math.min(36, parseFloat(previewSettings.titleSize) || 24)) + 'px';
                         }
                         sourceContent.querySelectorAll('.zujuanjs-question, .zujuanjs-answer-item').forEach(element => {
                             element.style.fontFamily = previewSettings.font;
@@ -3213,7 +3423,6 @@
                         if (clearSelection) {
                             activeBlockId = '';
                             questionToolbar.dataset.activeBlockId = '';
-                            document.body.classList.remove('question-tools-open');
                             paperContainer.querySelectorAll('.q-wrapper.is-selected').forEach(fragment => fragment.classList.remove('is-selected'));
                         }
                     }
@@ -3255,26 +3464,13 @@
                             setQuestionToolbarVisible(false);
                             return;
                         }
-                        const viewportRect = pageViewport.getBoundingClientRect();
                         setQuestionToolbarVisible(true);
-                        const toolbarRect = questionToolbar.getBoundingClientRect();
-                        const margin = 8;
-                        const left = Math.max(
-                            viewportRect.left + margin,
-                            Math.min(
-                                viewportRect.left + (viewportRect.width - toolbarRect.width) / 2,
-                                viewportRect.right - toolbarRect.width - margin
-                            )
-                        );
-                        questionToolbar.style.top = '64px';
-                        questionToolbar.style.left = Math.round(left) + 'px';
                     }
 
                     function activateQuestion(wrapper) {
                         const blockId = wrapper?.dataset.blockId;
                         if (!blockId) return;
                         activeBlockId = blockId;
-                        document.body.classList.add('question-tools-open');
                         questionToolbar.dataset.activeBlockId = blockId;
                         paperContainer.querySelectorAll('.q-wrapper').forEach(fragment => {
                             fragment.classList.toggle('is-selected', fragment.dataset.blockId === blockId);
@@ -3283,19 +3479,26 @@
                         scheduleQuestionToolbarPosition();
                     }
 
+                    // 在容器上做事件委托，只绑定一次，避免每次渲染重复 addEventListener
+                    let questionInteractionsBound = false;
                     function bindRenderedQuestionInteractions() {
-                        paperContainer.querySelectorAll('.q-wrapper').forEach(wrapper => {
-                            wrapper.addEventListener('pointerenter', () => activateQuestion(wrapper));
-                            wrapper.addEventListener('focusin', () => activateQuestion(wrapper));
-                            wrapper.addEventListener('click', event => {
+                        if (questionInteractionsBound) return;
+                        questionInteractionsBound = true;
+                        const findWrapper = target => target && target.closest ? target.closest('.q-wrapper') : null;
+                        // 点击切换：点题目内→选中/取消选中（已选中则取消），点题目外→收起工具栏
+                        paperContainer.addEventListener('click', event => {
+                            const wrapper = findWrapper(event.target);
+                            if (wrapper) {
                                 event.stopPropagation();
-                                activateQuestion(wrapper);
-                            });
-                            wrapper.addEventListener('keydown', event => {
-                                if (!['Enter', ' '].includes(event.key)) return;
-                                event.preventDefault();
-                                activateQuestion(wrapper);
-                            });
+                                // 已选中的题目再次点击 → 取消选中
+                                if (wrapper.dataset.blockId === activeBlockId) {
+                                    hideQuestionToolbar();
+                                } else {
+                                    activateQuestion(wrapper);
+                                }
+                            } else {
+                                hideQuestionToolbar();
+                            }
                         });
                     }
 
@@ -3404,7 +3607,9 @@
                                 const nestedBoundary = visit(child);
                                 if (nestedBoundary) return nestedBoundary;
 
-                                // 兼容没有文字节点、但自身有高度的站点组件。
+                                // 兼容没有文字节点、但自身有高度的站点组件：
+                                // 如公式 SVG、视频/音频占位、空 div 等（组卷网部分组件渲染后占高但无文本）。
+                                // 若其底部越过页底，则当作分页边界处理，避免整块被硬塞在上一页溢出。
                                 if (rect.bottom > pageBottom + overflowTolerance && !child.textContent.trim()) {
                                     return boundaryBefore(child);
                                 }
@@ -3454,18 +3659,38 @@
                     function addManualBreakMarker(pageContent) {
                         const marker = document.createElement('div');
                         marker.className = 'manual-break-indicator';
-                        marker.textContent = '手动分页';
                         pageContent.appendChild(marker);
                     }
 
                     function updatePageNumbers() {
                         const papers = Array.from(paperContainer.querySelectorAll('.paper'));
+                        // 检测哪些页是答案页（包含答案条目或答案标题）
+                        const isAnswerPage = paper => !!paper.querySelector('.zujuanjs-answer-entry, .zujuanjs-answers-header');
+                        let qPage = 0, aPage = 0;
                         papers.forEach((paper, index) => {
                             const footer = paper.querySelector('.page-footer');
-                            footer.textContent = (index + 1) + ' / ' + papers.length;
                             footer.style.display = previewSettings.showPageNumber === false ? 'none' : '';
+                            if (previewSettings.showPageNumber === false) return;
+                            if (isAnswerPage(paper)) {
+                                aPage++;
+                            } else {
+                                qPage++;
+                            }
                         });
-                        document.getElementById('preview-page-count').textContent = '共 ' + papers.length + ' 页';
+                        let qi = 0, ai = 0;
+                        papers.forEach((paper) => {
+                            const footer = paper.querySelector('.page-footer');
+                            if (isAnswerPage(paper)) {
+                                footer.textContent = '答案 ' + (++ai) + ' / ' + aPage;
+                            } else {
+                                footer.textContent = (++qi) + ' / ' + qPage;
+                            }
+                        });
+                        // 总页数显示：试题页 + 答案页
+                        const totalText = (qPage && aPage)
+                            ? ('共 ' + qPage + ' 页（试题）+ ' + aPage + ' 页（答案）')
+                            : ('共 ' + papers.length + ' 页');
+                        document.getElementById('preview-page-count').textContent = totalText;
                     }
 
                     function renderPages() {
@@ -3481,22 +3706,65 @@
                         const queue = Array.from(sourceContent.children, child => child.cloneNode(true));
                         let page = createPaper();
                         let guard = 0;
+                        let answersBreakDone = false; // 答案区是否已强制分页，避免重复分页
 
-                        while (queue.length && guard < 10000) {
+                        // 当前页已有内容则翻到新页（并补手动分页标记），随后标记答案区已分页。
+                        // 既用于显式 .page-break，也用于参考答案标题/首个答案条目兜底分页，避免重复代码。
+                        function forceNewPageIfHasContent() {
+                            if (pageHasContent(page.content)) {
+                                addManualBreakMarker(page.content);
+                                page = createPaper();
+                            }
+                            answersBreakDone = true;
+                        }
+
+                        while (queue.length && guard < MAX_PAGINATE_ITER) {
                             guard++;
                             const node = queue.shift();
 
                             if (node.classList.contains('page-break')) {
-                                if (pageHasContent(page.content)) {
-                                    addManualBreakMarker(page.content);
-                                    page = createPaper();
-                                }
+                                forceNewPageIfHasContent();
                                 continue;
+                            }
+
+                            // 兜底：若 .page-break 未被检测到，遇到参考答案标题或首个答案条目时强制从新页开始
+                            const isAnswersHeader = node.classList.contains('zujuanjs-answers-header');
+                            const isAnswerEntry = node.classList.contains('zujuanjs-answer-entry');
+                            if ((isAnswersHeader || isAnswerEntry) && !answersBreakDone) {
+                                forceNewPageIfHasContent();
                             }
 
                             const pageAlreadyHasContent = pageHasContent(page.content);
                             page.content.appendChild(node);
-                            if (!nodeOverflowsPage(node, page.content)) continue;
+                            if (!nodeOverflowsPage(node, page.content)) {
+                                // 章节标题 keep-with-next：标题本身放得下，但若紧随的题目放不下，
+                                // 则把标题也推到下一页，避免「标题孤悬底部、题目跑到下页」。
+                                if (node.classList.contains('zujuanjs-section-title') && pageAlreadyHasContent && queue.length > 0) {
+                                    const nextNode = queue[0];
+                                    if (nextNode && nextNode.classList.contains('q-wrapper')) {
+                                        const nextClone = nextNode.cloneNode(true);
+                                        page.content.appendChild(nextClone);
+                                        const nextOverflows = nodeOverflowsPage(nextClone, page.content);
+                                        page.content.removeChild(nextClone);
+                                        if (nextOverflows) {
+                                            node.remove();
+                                            page = createPaper();
+                                            page.content.appendChild(node);
+                                            queue.unshift(nextNode);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // 题目不跨页：当前页已有内容、整题放不下时，整题移到下一页，不在题内拆分。
+                            // 仅当题目本身超过一整页（建到空页仍溢出）才允许拆分，避免死循环。
+                            if (node.classList.contains('q-wrapper') && pageAlreadyHasContent) {
+                                node.remove();
+                                page = createPaper();
+                                queue.unshift(node);
+                                continue;
+                            }
 
                             let split = null;
                             if (node.classList.contains('q-wrapper')) {
@@ -3545,6 +3813,7 @@
                         restoreReadingAnchor(readingAnchor);
                         updateQuestionToolbarState();
                         scheduleQuestionToolbarPosition();
+                        try { window.parent.postMessage({ type: 'zujuanPreviewRendered', token: PREVIEW_TOKEN }, '*'); } catch (e) {}
                         isRendering = false;
                         document.dispatchEvent(new CustomEvent('zujuan-preview-rendered', {
                             detail: { version: renderVersion, pages: paperContainer.querySelectorAll('.paper').length }
@@ -3563,6 +3832,19 @@
                         });
                     }
 
+                    // 内容类复选框（试题/知识点/答案/答案附末尾）改动：通过 postMessage 触发父级增量重建，
+                    // 父级只把新的题目内容 HTML 发回 iframe 内部替换 sourceContent 并重渲染，不再重载 iframe（避免黑屏闪烁）。
+                    // 加防抖，避免连续勾选时反复重建。
+                    let rebuildTimer = 0;
+                    function scheduleRebuild() {
+                        if (rebuildTimer) clearTimeout(rebuildTimer);
+                        rebuildTimer = setTimeout(function() {
+                            rebuildTimer = 0;
+                            const nextSettings = readSettingsFromEditor();
+                            window.parent.postMessage({ type: 'rebuildZujuanPreview', settings: nextSettings, token: PREVIEW_TOKEN }, '*');
+                        }, 150);
+                    }
+
                     document.querySelectorAll('[data-layout]').forEach(button => {
                         button.addEventListener('click', () => setPreviewLayout(button.dataset.layout));
                     });
@@ -3570,7 +3852,6 @@
                     document.querySelector('[data-zoom="in"]').addEventListener('click', () => stepPreviewZoom(1));
                     document.querySelector('[data-zoom="auto"]').addEventListener('click', () => setPreviewZoom('auto'));
                     editorToggle.addEventListener('click', () => toggleEditor());
-                    document.getElementById('editor-close').addEventListener('click', () => toggleEditor(false));
 
                     document.querySelectorAll('[data-editor-tab]').forEach(button => {
                         button.addEventListener('click', () => setEditorTab(button.dataset.editorTab));
@@ -3593,17 +3874,47 @@
                         control.addEventListener(eventName, () => {
                             previewSettings.layoutPreset = 'custom';
                             updateLayoutPresetUI();
-                            setSaveStatus('正在保存…');
-                            if (control.id === 'setting-mode') {
-                                const nextSettings = readSettingsFromEditor();
-                                window.parent.postMessage({ type: 'rebuildZujuanPreview', settings: nextSettings }, '*');
+                            if (control.id === 'setting-answers-at-end') {
+                                // 答案附末尾 必须与 答案 关联：勾选"答案附末尾"时自动勾选"答案"
+                                if (control.checked) {
+                                    const answerCb = document.querySelector('input[name="setting-content"][value="a"]');
+                                    if (answerCb && !answerCb.checked) answerCb.checked = true;
+                                }
+                                scheduleRebuild();
+                                savePrintSettings();
                                 return;
                             }
+                            if (control.name === 'setting-content') {
+                                // 取消"答案"时，连带取消"答案附末尾"
+                                if (control.value === 'a' && !control.checked) {
+                                    const atEndCb = document.getElementById('setting-answers-at-end');
+                                    if (atEndCb && atEndCb.checked) atEndCb.checked = false;
+                                }
+                                scheduleRebuild();
+                                savePrintSettings();
+                                return;
+                            }
+                            if (control.id === 'setting-mode') {
+                                scheduleRebuild();
+                                savePrintSettings();
+                                return;
+                            }
+                            if (control.id === 'setting-auto-checkin') {
+                                // [S4.2] 自动签到为全局偏好（非单卷设置），单独走 saveZujuanPreviewPreference 通道持久化
+                                savePreviewPreference('autoCheckIn', control.checked ? 'true' : 'false');
+                                return;
+                            }
+                            if (control.id === 'setting-self-check') {
+                                // [C] 自检模式为全局偏好，单独走 saveZujuanPreviewPreference 通道持久化
+                                savePreviewPreference('selfCheck', control.checked ? 'true' : 'false');
+                                return;
+                            }
+                            setSaveStatus('正在保存…');
                             queueEditorSettings();
                         });
                     });
                     document.getElementById('editor-reset').addEventListener('click', () => {
-                        applyLayoutPreset('exam');
+                        applyLayoutPreset('compact');
                     });
 
                     let resizePointerId = null;
@@ -3647,9 +3958,6 @@
                         performQuestionAction(button.dataset.questionAction);
                     });
 
-                    paperContainer.addEventListener('click', event => {
-                        if (!event.target.closest('.q-wrapper')) hideQuestionToolbar();
-                    });
                     pageViewport.addEventListener('scroll', scheduleQuestionToolbarPosition, { passive: true });
                     pageViewport.addEventListener('pointerdown', () => pageViewport.focus({ preventScroll: true }));
                     pageViewport.addEventListener('wheel', event => {
@@ -3710,7 +4018,6 @@
                         }
                     });
                     editorPanel.classList.add('editor-initializing');
-                    document.body.classList.toggle('question-tools-open', Boolean(activeBlockId));
                     applyBlockEditsToSource();
                     writeSettingsToEditor();
                     applyDocumentStyles();
@@ -3719,6 +4026,27 @@
                     toggleEditor(editorOpen, false);
                     requestAnimationFrame(() => editorPanel.classList.remove('editor-initializing'));
                     scheduleRender();
+
+                    // 接收父窗口增量更新：仅替换题目内容并重渲染，避免 iframe 整页重载（黑屏闪烁）
+                    window.addEventListener('message', function (e) {
+                        const d = e.data || {};
+                        if (!d || d.token !== PREVIEW_TOKEN) return;
+                        if (d.type === 'updateZujuanSource' && typeof d.html === 'string') {
+                            sourceContent.innerHTML = d.html;
+                            // 图片可能尚未从缓存就绪，绑定加载完成后重渲染，保证分页高度准确
+                            sourceContent.querySelectorAll('img').forEach(img => {
+                                if (!img.complete) {
+                                    img.addEventListener('load', () => { applyFormulaScale(); scheduleRender(); }, { once: true });
+                                    img.addEventListener('error', scheduleRender, { once: true });
+                                }
+                            });
+                            // 关键：增量重建也必须重新应用公式缩放，否则新注入的公式图片
+                            // 没有 style.width，以自然尺寸渲染（比缩放后小）。注入的 html 已自带字体等内联样式，
+                            // 无需再 applyDocumentStyles 重写所有题目节点，去掉冗余开销。
+                            applyFormulaScale();
+                            scheduleRender();
+                        }
+                    });
                 </script>
             </body>
             </html>
@@ -3732,11 +4060,18 @@
                 overlay.id = 'zujuanjs-preview-overlay';
                 document.body.appendChild(overlay);
             }
-            const iframe = document.createElement('iframe');
-            iframe.title = '试卷排版预览';
+            // 复用同一个 iframe 元素，避免每次重建/销毁带来的布局抖动与对象开销
+            let iframe = overlay.querySelector('iframe.zujuanjs-preview-frame');
+            if (!iframe) {
+                iframe = document.createElement('iframe');
+                iframe.className = 'zujuanjs-preview-frame';
+                iframe.title = '试卷排版预览';
+                // 仅允许脚本运行，不授予同源权限：iframe 无法直接访问 parent.document，
+                // 只能通过携带 PREVIEW_TOKEN 的 postMessage 与父级通信，缩小权限面。
+                iframe.setAttribute('sandbox', 'allow-scripts allow-modals');
+                overlay.appendChild(iframe);
+            }
             iframe.srcdoc = htmlContent;
-            overlay.innerHTML = '';
-            overlay.appendChild(iframe);
         }
     }
 
