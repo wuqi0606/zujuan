@@ -1005,7 +1005,9 @@
                     return ((idx ? idx.textContent : '') + (name ? name.textContent : '')).trim();
                 } },
             ];
-            document.querySelectorAll('.sec-title, .questype-head .questypetitle, .tk-quest-item.quesroot').forEach(node => {
+            const sourceNodes = [...document.querySelectorAll('.sec-title, .questype-head .questypetitle, .tk-quest-item.quesroot')]
+                .filter(node => !node.closest('.deleted-box'));
+            sourceNodes.forEach(node => {
                 for (const ex of SECTION_TITLE_EXTRACTORS) {
                     if (node.matches(ex.sel)) {
                         const t = ex.get(node);
@@ -3226,6 +3228,12 @@
                         applyDocumentStyles();
                         applyPreviewView();
                         scheduleRender();
+                        // [fix] 恢复默认可能改变"打印内容"开关（试题/知识点/答案/附末尾），这些开关属于
+                        // 父窗口提取源内容阶段（generateSourceContentHTML），iframe 内 scheduleRender 仅重新
+                        // 分页、不会删除已生成的源内容 DOM。必须通知父窗口按最新设置重新提取源内容，否则
+                        // 预览里知识点等仍残留（勾选框已取消但内容不消失）。仅 resetAll 路径需要（显式
+                        // 预设按钮只改排版字段，不影响内容开关，无需重建）。
+                        if (resetAll) scheduleRebuild();
                         setSaveStatus('正在保存…');
                         scheduleSettingsSave();
                     }
