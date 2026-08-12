@@ -104,7 +104,7 @@
                 font: '"Times New Roman", SimSun, "Songti SC", serif', size: '16px', lineHeight: '1.5',
                 titleSize: '24px', pageFont: '"Times New Roman", SimSun, "Songti SC", serif', pageSize: '12px',
                 pageBold: true, showPageNumber: true, pageMargins: '18,15,22,15', questionSpacing: '10',
-                paragraphSpacing: '8', contentAlign: 'left', numberGap: '0.55', answerRowHeight: '1.8', pageGap: '20',
+                paragraphSpacing: '8', contentAlign: 'left', numberGap: '0.55', pageGap: '20',
                 previewLayout: 'double', previewZoom: 'auto'
             }
         },
@@ -138,8 +138,8 @@
         { key: 'paragraphSpacing',storage: 'paragraphSpacing',  def: '4',             type: 'str' },
         { key: 'contentAlign',    storage: 'contentAlign',      def: 'left',          type: 'str' },
         { key: 'numberGap',       storage: 'numberGap',         def: '0.55',          type: 'str' },
-        { key: 'answerRowHeight', storage: 'answerRowHeight',   def: '1.8',           type: 'str' },
         { key: 'pageGap',         storage: 'pageGap',           def: '20',            type: 'str' },
+        { key: 'baseAnswerLinesByType', storage: 'baseAnswerLinesByType', def: '{"objective":0,"judge":0,"fill":0,"conceptFill":0,"solution":0}', type: 'str' },
         { key: 'editorPanelWidth',storage: 'editorPanelWidth',  def: '340',           type: 'str' },
         { key: 'editorPanelTab',  storage: 'editorPanelTab',    def: 'document',      type: 'str' },
         { key: 'editorOpen',      storage: 'editorOpen',        def: true,            type: 'boolStr' },
@@ -608,9 +608,9 @@
             result.readingAnchor = has('readingAnchor') && overrides.readingAnchor && typeof overrides.readingAnchor === 'object'
                 ? overrides.readingAnchor
                 : null;
-            // 保证 layoutPreset 始终是已知预设键：脏值/空串（旧迁移残留、误写）一律回退到默认 'compact'，
-            // 避免首屏出现「实际是紧凑版式、UI 却显示自定义」的状态不一致。
-            if (!LAYOUT_PRESETS[result.layoutPreset]) result.layoutPreset = 'compact';
+            // 保证 layoutPreset 始终是已知预设键或 'custom'：脏值/空串（旧迁移残留、误写）一律回退到默认 'compact'，
+            // 避免首屏出现「实际是紧凑版式、UI 却显示自定义」的状态不一致。'custom' 为手动微调后的有效状态。
+            if (!LAYOUT_PRESETS[result.layoutPreset] && result.layoutPreset !== 'custom') result.layoutPreset = 'compact';
             return result;
         }
 
@@ -623,7 +623,12 @@
                     case 'csv': GM_setValue(s.storage, Array.isArray(val) ? val.join(',') : val); break;
                     case 'boolStr': GM_setValue(s.storage, val ? 'true' : 'false'); break;
                     case 'boolObj': GM_setValue(s.storage, Boolean(val)); break;
-                    default: GM_setValue(s.storage, val);
+                    default:
+                        if (s.key === 'baseAnswerLinesByType' && val && typeof val === 'object') {
+                            GM_setValue(s.storage, JSON.stringify(val));
+                        } else {
+                            GM_setValue(s.storage, val);
+                        }
                 }
             }
         }
@@ -959,7 +964,23 @@
             const paragraphSpacing = Math.max(0, Math.min(24, Number(layoutOptions.paragraphSpacing) || 8));
             const contentAlign = ['left', 'justify'].includes(layoutOptions.contentAlign) ? layoutOptions.contentAlign : 'left';
             const numberGap = Math.max(0.2, Math.min(2, Number(layoutOptions.numberGap) || 0.55));
-            const answerRowHeight = Math.max(1, Math.min(6, Number(layoutOptions.answerRowHeight) || 1.8));
+            // 按题型分别设置默认答题行数：解析为 {objective,judge,fill,conceptFill,solution}，每类 0–8 行
+            const baseAnswerLinesByType = (() => {
+                const def = { objective: 0, judge: 0, fill: 0, conceptFill: 0, solution: 0 };
+                let parsed = null;
+                try {
+                    parsed = typeof layoutOptions.baseAnswerLinesByType === 'string'
+                        ? JSON.parse(layoutOptions.baseAnswerLinesByType)
+                        : (layoutOptions.baseAnswerLinesByType && typeof layoutOptions.baseAnswerLinesByType === 'object' ? layoutOptions.baseAnswerLinesByType : null);
+                } catch (e) { parsed = null; }
+                if (parsed && typeof parsed === 'object') {
+                    for (const k of Object.keys(def)) {
+                        const v = Number(parsed[k]);
+                        def[k] = Number.isFinite(v) ? Math.max(0, Math.min(24, Math.round(v))) : 0;
+                    }
+                }
+                return def;
+            })();
             const pageGap = Math.max(8, Math.min(48, Number(layoutOptions.pageGap) || 20));
             const editorPanelWidth = Math.max(280, Math.min(520, Number(layoutOptions.editorPanelWidth) || 340));
             const editorPanelTab = layoutOptions.editorPanelTab === 'page' ? 'page' : 'document';
@@ -1203,21 +1224,23 @@
                 font, size, lineHeight, title, titleSize, pageFont, pageSize, pageBold,
                 showPageNumber, marginTop, marginRight, marginBottom, marginLeft,
                 questionSpacing, previewLayout, previewZoom, paragraphSpacing, contentAlign,
-                numberGap, answerRowHeight, pageGap, editorPanelWidth, editorPanelTab,
+                numberGap, pageGap, editorPanelWidth, editorPanelTab,
                 editorOpen, documentEdits, readingAnchor, contentFlags, answersAtEnd,
+                baseAnswerLinesByType,
                 contentWidth, contentHeight, footerBottom
             };
         }
 
         generatePreviewHTML(opts = {}) {
             const src = this.generateSourceContentHTML(opts);
-            const { html: contentHtml, font, size, lineHeight, title, titleSize, pageFont, pageSize, pageBold, showPageNumber, marginTop, marginRight, marginBottom, marginLeft, questionSpacing, previewLayout, previewZoom, paragraphSpacing, contentAlign, numberGap, answerRowHeight, pageGap, editorPanelWidth, editorPanelTab, editorOpen, documentEdits, readingAnchor, contentFlags, answersAtEnd, contentWidth, contentHeight, footerBottom } = src;
+            const { html: contentHtml, font, size, lineHeight, title, titleSize, pageFont, pageSize, pageBold, showPageNumber, marginTop, marginRight, marginBottom, marginLeft, questionSpacing, previewLayout, previewZoom, paragraphSpacing, contentAlign, numberGap, pageGap, editorPanelWidth, editorPanelTab, editorOpen, documentEdits, readingAnchor, contentFlags, answersAtEnd, baseAnswerLinesByType, contentWidth, contentHeight, footerBottom } = src;
             const previewSettingsJson = JSON.stringify({
                 mode: 'q', font, size, lineHeight, title, titleSize: `${titleSize}px`,
                 pageFont, pageSize, pageBold, showPageNumber, pageMargins: `${marginTop},${marginRight},${marginBottom},${marginLeft}`,
                 questionSpacing: String(questionSpacing), previewLayout, previewZoom,
                 paragraphSpacing: String(paragraphSpacing), contentAlign, numberGap: String(numberGap),
-                answerRowHeight: String(answerRowHeight), pageGap: String(pageGap),
+                pageGap: String(pageGap),
+                baseAnswerLinesByType,
                 editorPanelWidth: String(editorPanelWidth), editorPanelTab, editorOpen, documentEdits, readingAnchor,
                 layoutPreset: (opts.layoutOptions && opts.layoutOptions.layoutPreset) || 'compact',
                 contentFlags, answersAtEnd,
@@ -1308,7 +1331,7 @@
                         background: transparent;
                         page-break-inside: avoid;
                     }
-                    .answer-blank { height: 2.5em; }
+                    .answer-blank { height: 1.8em; }
                     .answer-blank-large { height: 12em; }
 
                     /* JS 动态插入的自然分页占位符 */
@@ -1705,6 +1728,23 @@
                     }
                     .editor-field input:focus,
                     .editor-field select:focus { border-color: #1677ff; box-shadow: 0 0 0 2px rgba(22,119,255,0.14); }
+                    .base-lines-grid { display: grid; grid-template-columns: 1fr minmax(90px, 0.5fr); gap: 6px 8px; align-items: center; width: 100%; }
+                    .base-lines-grid.wide { grid-column: 1 / -1; }
+                    .base-lines-grid .bl-label { color: #6d737a; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 28px; }
+                    .bl-stepper { display: flex; align-items: stretch; height: 28px; min-width: 0; border: 1px solid #d3d7db; border-radius: 4px; overflow: hidden; box-sizing: border-box; }
+                    .bl-stepper .bl-stepper-btn { width: 26px; flex: 0 0 26px; border: none; border-right: 1px solid #d3d7db; background: #f5f6f7; color: #555; font-size: 15px; line-height: 1; cursor: pointer; -webkit-user-select: none; user-select: none; }
+                    .bl-stepper .bl-stepper-btn + .bl-stepper-input-wrap + .bl-stepper-btn { border-right: none; border-left: 1px solid #d3d7db; }
+                    .bl-stepper .bl-stepper-input-wrap { flex: 1 1 0; min-width: 0; position: relative; display: flex; align-items: center; justify-content: center; gap: 3px; padding: 0 6px 0 4px; }
+                    .bl-stepper .bl-stepper-input-wrap input { flex: 1 1 auto; min-width: 0; width: auto; height: auto; border: none; padding: 0; text-align: center; background: #fff; color: #25292d; font-size: 12px; line-height: 1; outline: none; }
+                    .bl-stepper .bl-stepper-input-wrap input::-webkit-outer-spin-button,
+                    .bl-stepper .bl-stepper-input-wrap input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+                    .bl-stepper .bl-stepper-input-wrap input[type=number] { -moz-appearance: textfield; }
+                    .bl-stepper .bl-stepper-input-wrap span { position: static; transform: none; color: #888; font-size: 11px; line-height: 1; pointer-events: none; white-space: nowrap; }
+                    .bl-stepper .bl-stepper-btn:hover { background: #e9ecef; }
+                    .bl-stepper .bl-stepper-btn:active { background: #dde1e5; }
+                    .bl-stepper:has(.bl-stepper-input-wrap input:focus) { border-color: #1677ff; box-shadow: 0 0 0 2px rgba(22,119,255,0.14); }
+                    .bl-stepper .bl-stepper-input-wrap input.form-control-sm:focus { border-color: transparent; box-shadow: none; background: #fff; }
+                    .editor-separator { height: 1px; background: #e4ebe8; margin: 6px 0; grid-column: 1 / -1; }
                     .editor-margin-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
                     .editor-margin-grid .editor-field { gap: 3px; font-size: 10px; }
                     .editor-margin-grid input { padding: 0 5px; text-align: center; }
@@ -2114,7 +2154,6 @@
                         --page-gap: ${pageGap}px;
                         --paragraph-spacing: ${paragraphSpacing}px;
                         --number-gap: ${numberGap}em;
-                        --answer-row-height: ${answerRowHeight}em;
                         --content-align: ${contentAlign};
                     }
                     html, body {
@@ -2228,7 +2267,6 @@
                     .answer-blank {
                         display: block;
                         width: 100%;
-                        height: var(--answer-row-height);
                         margin: 0;
                         padding: 0;
                         border: 0 !important;
@@ -2620,6 +2658,8 @@
                     .editor-section { border-bottom-color: #e4ebe8; }
                     .editor-section-note,
                     .editor-field { color: var(--ui-muted); }
+                    .base-lines-grid .bl-label,
+                    .base-lines-grid .bl-input-wrap span { color: var(--ui-muted); }
                     .editor-panel .form-control,
                     .editor-panel .form-select,
                     .editor-check,
@@ -2908,6 +2948,43 @@
                                         <label class="editor-field editor-field-unit">题号间距<input class="form-control form-control-sm" id="setting-number-gap" type="number" min="0.2" max="2" step="0.05"><span>em</span></label>
                                     </div>
                                 </section>
+                                <section class="editor-section">
+                                    <div class="editor-section-title">默认答题行数</div>
+                                    <div class="editor-grid">
+                                        <div class="base-lines-grid wide">
+                                            <div class="bl-label">单选题/多选题</div>
+                                            <div class="bl-stepper">
+                                                <button type="button" class="bl-stepper-btn" data-step="-1" data-target="setting-base-lines-objective">−</button>
+                                                <div class="bl-stepper-input-wrap editor-field-unit"><input class="form-control form-control-sm" id="setting-base-lines-objective" type="number" min="0" max="24" step="1"><span>行</span></div>
+                                                <button type="button" class="bl-stepper-btn" data-step="1" data-target="setting-base-lines-objective">+</button>
+                                            </div>
+                                            <div class="bl-label">判断题</div>
+                                            <div class="bl-stepper">
+                                                <button type="button" class="bl-stepper-btn" data-step="-1" data-target="setting-base-lines-judge">−</button>
+                                                <div class="bl-stepper-input-wrap editor-field-unit"><input class="form-control form-control-sm" id="setting-base-lines-judge" type="number" min="0" max="24" step="1"><span>行</span></div>
+                                                <button type="button" class="bl-stepper-btn" data-step="1" data-target="setting-base-lines-judge">+</button>
+                                            </div>
+                                            <div class="bl-label">概念填空</div>
+                                            <div class="bl-stepper">
+                                                <button type="button" class="bl-stepper-btn" data-step="-1" data-target="setting-base-lines-conceptFill">−</button>
+                                                <div class="bl-stepper-input-wrap editor-field-unit"><input class="form-control form-control-sm" id="setting-base-lines-conceptFill" type="number" min="0" max="24" step="1"><span>行</span></div>
+                                                <button type="button" class="bl-stepper-btn" data-step="1" data-target="setting-base-lines-conceptFill">+</button>
+                                            </div>
+                                            <div class="bl-label">填空题</div>
+                                            <div class="bl-stepper">
+                                                <button type="button" class="bl-stepper-btn" data-step="-1" data-target="setting-base-lines-fill">−</button>
+                                                <div class="bl-stepper-input-wrap editor-field-unit"><input class="form-control form-control-sm" id="setting-base-lines-fill" type="number" min="0" max="24" step="1"><span>行</span></div>
+                                                <button type="button" class="bl-stepper-btn" data-step="1" data-target="setting-base-lines-fill">+</button>
+                                            </div>
+                                            <div class="bl-label">解答题</div>
+                                            <div class="bl-stepper">
+                                                <button type="button" class="bl-stepper-btn" data-step="-1" data-target="setting-base-lines-solution">−</button>
+                                                <div class="bl-stepper-input-wrap editor-field-unit"><input class="form-control form-control-sm" id="setting-base-lines-solution" type="number" min="0" max="24" step="1"><span>行</span></div>
+                                                <button type="button" class="bl-stepper-btn" data-step="1" data-target="setting-base-lines-solution">+</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </section>
                             </div>
                             <div class="editor-pane" id="editor-pane-page" role="tabpanel" aria-labelledby="editor-tab-page" hidden>
                                 <section class="editor-section">
@@ -2934,8 +3011,14 @@
                                 <section class="editor-section">
                                     <div class="editor-section-title">页面显示</div>
                                     <div class="editor-grid">
-                                        <label class="editor-field editor-field-unit">答题行高<input class="form-control form-control-sm" id="setting-answer-row-height" type="number" min="1" max="6" step="0.1"><span>em</span></label>
-                                        <label class="editor-field editor-field-unit">页面间距<input class="form-control form-control-sm" id="setting-page-gap" type="number" min="8" max="48" step="1"><span>px</span></label>
+                                        <div class="base-lines-grid wide">
+                                            <div class="bl-label">页面间距</div>
+                                            <div class="bl-stepper">
+                                                <button type="button" class="bl-stepper-btn" data-step="-1" data-target="setting-page-gap">−</button>
+                                                <div class="bl-stepper-input-wrap editor-field-unit"><input class="form-control form-control-sm" id="setting-page-gap" type="number" min="8" max="48" step="1"><span>px</span></div>
+                                                <button type="button" class="bl-stepper-btn" data-step="1" data-target="setting-page-gap">+</button>
+                                            </div>
+                                        </div>
                                     </div>
                                 </section>
                                 <section class="editor-section">
@@ -2999,8 +3082,10 @@
                     }
 
                     function updateLayoutPresetUI() {
-                        // 以用户当前选择的版式为准；脏值/空串回退到默认 'compact'（与父窗口归一逻辑一致）
-                        const requested = layoutPresets[previewSettings.layoutPreset] ? previewSettings.layoutPreset : 'compact';
+                        // 以用户当前选择的版式为准；'custom' 为手动微调状态，脏值/空串回退到默认 'compact'（与父窗口归一逻辑一致）
+                        const requested = previewSettings.layoutPreset === 'custom'
+                            ? 'custom'
+                            : (layoutPresets[previewSettings.layoutPreset] ? previewSettings.layoutPreset : 'compact');
                         const preset = layoutPresets[requested];
                         const matchesPreset = preset && Object.entries(preset.settings).every(([key, value]) => String(previewSettings[key]) === String(value));
                         // 所选版式与当前各项设置仍一致→高亮该版式；已偏离→归为自定义
@@ -3070,6 +3155,25 @@
                         return serialized;
                     }
 
+                    // 按题型分别设置默认答题行数：精确匹配 6 种固定题型。
+                    // 注意顺序：概念填空 必须先于 填空 匹配，否则"概念填空"会被 /填空/ 正则吞掉而归错类。
+                    function resolveQuestionType(wrapper) {
+                        let prev = wrapper.previousElementSibling;
+                        while (prev) {
+                            if (prev.classList.contains('zujuanjs-section-title')) {
+                                const text = prev.textContent || '';
+                                if (/概念填空/.test(text)) return 'conceptFill';
+                                if (/填空/.test(text)) return 'fill';
+                                if (/单选|多选/.test(text)) return 'objective';
+                                if (/判断/.test(text)) return 'judge';
+                                if (/解答/.test(text)) return 'solution';
+                                return 'unknown';
+                            }
+                            prev = prev.previousElementSibling;
+                        }
+                        return 'unknown';
+                    }
+
                     function applyBlockEditsToSource() {
                         Array.from(sourceContent.children)
                             .filter(element => element.classList.contains('page-break'))
@@ -3078,10 +3182,21 @@
                             .forEach(element => element.remove());
                         const wrappers = Array.from(sourceContent.children).filter(element => element.classList.contains('q-wrapper'));
 
+                        let byTypeBase = previewSettings.baseAnswerLinesByType || {};
+                        if (typeof byTypeBase === 'string') { try { byTypeBase = JSON.parse(byTypeBase); } catch (e) { byTypeBase = {}; } }
+                        if (!byTypeBase || typeof byTypeBase !== 'object') byTypeBase = {};
+
                         wrappers.forEach(wrapper => {
                             const state = getBlockEdit(wrapper.dataset.blockId);
-                            wrapper.dataset.extraLines = String(state.extraLines);
-                            for (let index = 0; index < state.extraLines; index++) {
+                            const isAnswerEntry = wrapper.classList.contains('zujuanjs-answer-entry');
+                            const qType = isAnswerEntry ? 'answer-entry' : resolveQuestionType(wrapper);
+                            // 按题型取默认行数；unknown（识别不出）或答案块不加默认行（Q3 B）。
+                            const extraBase = (!isAnswerEntry && qType !== 'unknown')
+                                ? Math.max(0, Math.min(24, Math.round(Number(byTypeBase[qType]) || 0)))
+                                : 0;
+                            const effectiveLines = state.extraLines + extraBase;
+                            wrapper.dataset.extraLines = String(effectiveLines);
+                            for (let index = 0; index < effectiveLines; index++) {
                                 const blank = document.createElement('div');
                                 blank.className = 'answer-blank';
                                 blank.dataset.lineIndex = String(index + 1);
@@ -3151,7 +3266,14 @@
                         ['top', 'right', 'bottom', 'left'].forEach((side, index) => {
                             document.getElementById('setting-margin-' + side).value = margins[index] || 15;
                         });
-                        document.getElementById('setting-answer-row-height').value = previewSettings.answerRowHeight;
+                        // 按题型回填默认答题行数（每种题型一个输入框）
+                        let byType = previewSettings.baseAnswerLinesByType || {};
+                        if (typeof byType === 'string') { try { byType = JSON.parse(byType); } catch (e) { byType = {}; } }
+                        if (!byType || typeof byType !== 'object') byType = {};
+                        ['objective', 'judge', 'fill', 'conceptFill', 'solution'].forEach(k => {
+                            const el = document.getElementById('setting-base-lines-' + k);
+                            if (el) el.value = String(Number(byType[k]) || 0);
+                        });
                         document.getElementById('setting-page-gap').value = previewSettings.pageGap;
                         document.getElementById('setting-page-number').checked = previewSettings.showPageNumber !== false;
                         setSelectValue('setting-page-font', previewSettings.pageFont);
@@ -3182,7 +3304,14 @@
                             numberGap: String(clamp(document.getElementById('setting-number-gap').value, 0.2, 2, 0.55)),
                             pageMargins: [margin('top'), margin('right'), margin('bottom'), margin('left')].join(','),
                             layoutPreset: layoutPresets[previewSettings.layoutPreset] ? previewSettings.layoutPreset : 'custom',
-                            answerRowHeight: String(clamp(document.getElementById('setting-answer-row-height').value, 1, 6, 1.8)),
+                            baseAnswerLinesByType: (() => {
+                                const obj = {};
+                                ['objective', 'judge', 'fill', 'conceptFill', 'solution'].forEach(k => {
+                                    const el = document.getElementById('setting-base-lines-' + k);
+                                    obj[k] = el ? Math.max(0, Math.min(24, Math.round(Number(el.value) || 0))) : 0;
+                                });
+                                return obj;
+                            })(),
                             pageGap: String(clamp(document.getElementById('setting-page-gap').value, 8, 48, 20)),
                             showPageNumber: document.getElementById('setting-page-number').checked,
                             pageFont: document.getElementById('setting-page-font').value,
@@ -3286,7 +3415,6 @@
                         root.style.setProperty('--title-size', Math.max(18, Math.min(36, parseFloat(previewSettings.titleSize) || 24)) + 'px');
                         root.style.setProperty('--paragraph-spacing', clamp(previewSettings.paragraphSpacing, 0, 24, 8) + 'px');
                         root.style.setProperty('--number-gap', clamp(previewSettings.numberGap, 0.2, 2, 0.55) + 'em');
-                        root.style.setProperty('--answer-row-height', clamp(previewSettings.answerRowHeight, 1, 6, 1.8) + 'em');
                         root.style.setProperty('--page-gap', clamp(previewSettings.pageGap, 8, 48, 20) + 'px');
                         root.style.setProperty('--content-align', previewSettings.contentAlign === 'justify' ? 'justify' : 'left');
 
@@ -3362,6 +3490,7 @@
                         currentZoom = previewSettings.previewZoom;
                         applyDocumentStyles();
                         applyPreviewView();
+                        applyBlockEditsToSource();
                         scheduleRender();
                         scheduleSettingsSave();
                     }
@@ -3975,6 +4104,18 @@
                         button.addEventListener('click', () => applyLayoutPreset(button.dataset.layoutPreset));
                     });
 
+                    // 步进器输入框：输入时实时 clamp 到自身 min/max，捕获阶段先执行，保证后续 input 监听器读到已修正值
+                    document.querySelectorAll('.bl-stepper-input-wrap input').forEach(input => {
+                        input.addEventListener('input', () => {
+                            const raw = Number(input.value);
+                            if (!Number.isFinite(raw)) return;
+                            const min = Number.isFinite(Number(input.min)) ? Number(input.min) : 0;
+                            const max = Number.isFinite(Number(input.max)) ? Number(input.max) : 24;
+                            const clamped = Math.max(min, Math.min(max, Math.round(raw)));
+                            if (String(clamped) !== input.value) input.value = String(clamped);
+                        }, true);
+                    });
+
                     const editorControls = Array.from(editorPanel.querySelectorAll('input, select'));
                     editorControls.forEach(control => {
                         const eventName = control.tagName === 'INPUT' && ['text', 'number'].includes(control.type) ? 'input' : 'change';
@@ -4020,6 +4161,27 @@
                             queueEditorSettings();
                         });
                     });
+
+                    // 步进器：− / + 按钮（题型答题行数 + 页面间距共用）
+                    document.querySelectorAll('.bl-stepper-btn').forEach(btn => {
+                        btn.addEventListener('mousedown', event => {
+                            // 阻止按钮获得焦点，保持输入框焦点，从而维持整体焦点高亮
+                            event.preventDefault();
+                            const input = document.getElementById(btn.dataset.target);
+                            if (input) input.focus();
+                        });
+                        btn.addEventListener('click', () => {
+                            const input = document.getElementById(btn.dataset.target);
+                            if (!input) return;
+                            const step = Number(btn.dataset.step) || 0;
+                            const min = Number.isFinite(Number(input.min)) ? Number(input.min) : 0;
+                            const max = Number.isFinite(Number(input.max)) ? Number(input.max) : 24;
+                            const val = Math.max(min, Math.min(max, Math.round((Number(input.value) || 0) + step)));
+                            input.value = String(val);
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                        });
+                    });
+
                     document.getElementById('editor-reset').addEventListener('click', () => {
                         applyLayoutPreset('compact', true);
                     });
@@ -4154,6 +4316,9 @@
                             // [题间距] 增量重建后重新应用文档样式变量（含 --question-spacing），
                             // 确保跨页面复用同一 iframe 时间距等排版变量与当前 settings 一致。
                             applyDocumentStyles();
+                            // 增量重建会清空 sourceContent 并重新注入题目节点，必须重新应用 blockEdits
+                            //（手动分页/答题空行），否则这些编辑状态会丢失。
+                            applyBlockEditsToSource();
                             scheduleRender();
                         }
                     });
