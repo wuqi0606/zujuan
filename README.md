@@ -4,7 +4,7 @@
 
 - 适用站点：
   - `zujuan.xkw.com`（组卷网）
-  - `www.jyeoo.com`（菁优网 · 数学）
+  - `www.jyeoo.com`（菁优网）
 - 脚本版本：`7.0.0`
 - 许可证：[GNU AGPL v3.0](https://www.gnu.org/licenses/agpl-3.0.html)
 
