@@ -13,6 +13,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      *
 // @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/wuqi0606/zujuan/main/zujuan-print.user.js
+// @downloadURL  https://raw.githubusercontent.com/wuqi0606/zujuan/main/zujuan-print.user.js
 // @license      GNU Affero General Public License v3.0
 // ==/UserScript==
 

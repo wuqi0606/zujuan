@@ -36,20 +36,20 @@
 - **Firefox** → [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/)
 - **Safari** → [Userscripts](https://apps.apple.com/app/userscripts/id1463298887)
 
-### 第二步：安装本脚本
+### 第二步：一键安装（推荐）
 
-方式一（推荐）：
+已安装 Tampermonkey 的浏览器中，点击下面任意一个链接，会自动打开安装确认页，确认即可：
 
-1. 下载本仓库的 [`user.js`](./user.js)；
-2. 直接把文件拖入 Tampermonkey 管理器的「实用工具 → 导入」区域，或将其作为新脚本打开后保存。
+- **GitHub 安装**：[点击安装脚本](https://raw.githubusercontent.com/wuqi0606/zujuan/main/zujuan-print.user.js)
+- **jsDelivr 镜像**（国内访问更快；内容有最长约 12 小时的缓存延迟）：[点击安装脚本](https://cdn.jsdelivr.net/gh/wuqi0606/zujuan@main/zujuan-print.user.js)
 
-方式二：
+### 第三步：手动安装（备用）
 
-1. 在 Tampermonkey 管理器中「新建脚本」；
-2. 将本仓库 `user.js` 的全部内容粘贴进去；
-3. 保存（`Ctrl/Cmd + S`）。
+1. 下载本仓库的 [`zujuan-print.user.js`](./zujuan-print.user.js)；
+2. 直接把文件拖入 Tampermonkey 管理器的「实用工具 → 导入」区域，或将其作为新脚本打开后保存；
+3. 也可以在 Tampermonkey 管理器中「新建脚本」，粘贴本仓库 `zujuan-print.user.js` 的全部内容后保存（`Ctrl/Cmd + S`）。
 
-### 第三步：验证
+### 第四步：验证
 
 - 打开 `https://zujuan.xkw.com`（组卷网）或 `https://www.jyeoo.com`（菁优网）上的任意试卷；
 - 页面出现打印入口后点击，即可打开排版预览。
